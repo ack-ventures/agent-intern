@@ -687,9 +687,10 @@ Two extra postures the claude backend takes regardless of `sandbox`:
 - **Explicit-direction contract:** `claude_ask`/`claude_continue` require a **self-contained,
   explicit prompt** (what to do, which files, constraints, expected output) — the sub-agent has no
   shared context with the coordinator.
-- **Recursion guard:** every inner `claude -p` runs with `--strict-mcp-config --mcp-config "{}"`, so
-  it loads NO MCP servers and cannot re-enter agent-intern to spawn nested claude sessions. Set
-  `CLAUDE_BRIDGE_INHERIT_MCP=1` to disable this (then the inner session keeps its normal MCP config).
+- **Recursion guard:** every inner `claude -p` runs with
+  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, so it loads NO MCP servers and cannot
+  re-enter agent-intern to spawn nested claude sessions. Set `CLAUDE_BRIDGE_INHERIT_MCP=1` to
+  disable this (then the inner session keeps its normal MCP config).
 
 ### What that means for you
 

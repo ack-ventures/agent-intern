@@ -40,8 +40,9 @@ acceptEdits + scoped read-only git Bash (deliberately NO unrestricted Bash), and
 sandbox — they are tool-level permission boundaries.
 
 RECURSION GUARD. Every invocation also passes `--strict-mcp-config --mcp-config
-"{}"` so the inner claude loads NO MCP servers — otherwise it would read the
-user's ~/.claude.json and pull in agent-intern itself, letting a delegated
+'{"mcpServers":{}}'` so the inner claude loads NO MCP servers — otherwise it
+would read the user's ~/.claude.json and pull in agent-intern itself, letting a
+delegated
 sub-agent spawn nested `claude -p` sessions (worst under a swarm). Set
 CLAUDE_BRIDGE_INHERIT_MCP=1 to disable the guard (the inner session then keeps
 its normal MCP config) — a deliberate security trade-off, not a free feature:
@@ -300,14 +301,16 @@ def _permission_flags(sandbox: str) -> list[str]:
 def _mcp_guard_flags() -> list[str]:
     """Recursion-guard argv: inner claude loads NO MCP servers (see module docstring).
 
-    --strict-mcp-config restricts to exactly what --mcp-config names; "{}" names
-    nothing, so no MCP servers load — the inner session can't reach agent-intern
-    and spawn nested claude -p sessions. Invalid config docs are skipped, never
-    fatal, so the guard holds regardless.
+    --strict-mcp-config restricts to exactly what --mcp-config names; an empty
+    `{"mcpServers":{}}` names nothing, so no MCP servers load — the inner session
+    can't reach agent-intern and spawn nested claude -p sessions. The bare "{}"
+    form is REJECTED by claude's config validation ("mcpServers: expected record,
+    received undefined") and aborts the run at startup — verified live, so it must
+    never be used.
     """
     if _env_truthy("CLAUDE_BRIDGE_INHERIT_MCP"):
         return []
-    return ["--strict-mcp-config", "--mcp-config", "{}"]
+    return ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
 
 def _kill_tree(proc) -> None:

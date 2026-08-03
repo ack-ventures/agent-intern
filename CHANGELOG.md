@@ -16,8 +16,8 @@ summary.
   `claude_status` MCP tools, full `agent_swarm` + watch-mode support, on the uniform bridge
   interface. Reads the answer from stdout JSON (`--output-format json`), resumes by pinned session
   id (`--resume <id>`, else `--continue`), and runs the inner claude with a **recursion guard**
-  (`--strict-mcp-config --mcp-config "{}"` so it never loads agent-intern itself; disable with
-  `CLAUDE_BRIDGE_INHERIT_MCP=1`).
+  (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'` so it never loads agent-intern itself;
+  disable with `CLAUDE_BRIDGE_INHERIT_MCP=1`).
 - **Harness routing.** `claude_*`'s `model` param selects the backend: an Anthropic alias/id uses
   the plain `claude` binary (this Anthropic account); a claude-os harness id (`ds-flash`, `ds`,
   `k3`, `claude-ds`, … or any id from `~/.config/claude-os/models.txt`) runs through the `claude-os`

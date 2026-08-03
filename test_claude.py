@@ -107,7 +107,11 @@ def test_permission_flags_invalid_raises():
 
 
 def test_mcp_guard_on_by_default():
-    assert claude_bridge._mcp_guard_flags() == ["--strict-mcp-config", "--mcp-config", "{}"]
+    assert claude_bridge._mcp_guard_flags() == [
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+    ]
 
 
 def test_mcp_guard_off_with_inherit_env(monkeypatch):
