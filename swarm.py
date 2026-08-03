@@ -523,6 +523,8 @@ _BACKEND_ALIASES = {
     "github": "copilot",
     "gh": "copilot",
     "cursor": "cursor",
+    "claude": "claude",
+    "anthropic": "claude",
 }
 
 
@@ -543,8 +545,8 @@ def _normalize_tasks(tasks) -> list[dict]:
         backend = _BACKEND_ALIASES.get(str(t.get("backend", "")).strip().lower())
         if backend is None:
             raise ValueError(
-                f"task {i}: backend must be 'antigravity', 'codex', 'copilot', or "
-                f"'cursor' (got {t.get('backend')!r})"
+                f"task {i}: backend must be 'antigravity', 'codex', 'copilot', "
+                f"'cursor', or 'claude' (got {t.get('backend')!r})"
             )
         prompt = t.get("prompt")
         if not prompt or not str(prompt).strip():
@@ -553,12 +555,14 @@ def _normalize_tasks(tasks) -> list[dict]:
         workspace = os.path.abspath(ws) if ws else os.getcwd()
         sandbox = None
         model = None
+        effort = None
         if backend == "codex":
             import codex_bridge
 
             sandbox = t.get("sandbox") or codex_bridge.DEFAULT_SANDBOX
             codex_bridge.validate_sandbox(sandbox)  # fail fast on a bad policy
             model = t.get("model") or None
+            effort = t.get("effort") or None
         elif backend == "copilot":
             import copilot_bridge
 
@@ -571,6 +575,13 @@ def _normalize_tasks(tasks) -> list[dict]:
             sandbox = t.get("sandbox") or cursor_bridge.DEFAULT_SANDBOX
             cursor_bridge.validate_sandbox(sandbox)  # fail fast on a bad policy
             model = cursor_bridge.validate_model(t.get("model") or None)  # fail fast on a typo
+        elif backend == "claude":
+            import claude_bridge
+
+            sandbox = t.get("sandbox") or claude_bridge.DEFAULT_SANDBOX
+            claude_bridge.validate_sandbox(sandbox)  # fail fast on a bad policy
+            model = claude_bridge.validate_model(t.get("model") or None)  # fail fast on a typo
+            effort = t.get("effort") or None
         else:  # antigravity: no sandbox, but --model works in print mode (agy 1.0.16)
             import server
 
@@ -582,18 +593,21 @@ def _normalize_tasks(tasks) -> list[dict]:
                 "workspace": workspace,
                 "sandbox": sandbox,
                 "model": model,
+                "effort": effort,
             }
         )
     return out
 
 
-def _run_codex_worker(index, prompt, workspace, sandbox, model, timeout_s) -> WorkerResult:
+def _run_codex_worker(index, prompt, workspace, sandbox, model, effort, timeout_s) -> WorkerResult:
     import codex_bridge
 
     start = time.time()
     try:
         os.makedirs(workspace, exist_ok=True)
-        ans = codex_bridge.run_codex(prompt, workspace, sandbox, model, False, timeout_s, pin=False)
+        ans = codex_bridge.run_codex(
+            prompt, workspace, sandbox, model, False, timeout_s, effort, pin=False
+        )
         return WorkerResult(
             index,
             True,
@@ -613,7 +627,9 @@ def _run_codex_worker(index, prompt, workspace, sandbox, model, timeout_s) -> Wo
         )
 
 
-def _run_codex_worker_watched(index, prompt, workspace, sandbox, model, timeout_s) -> WorkerResult:
+def _run_codex_worker_watched(
+    index, prompt, workspace, sandbox, model, effort, timeout_s
+) -> WorkerResult:
     import codex_bridge
     import server
     import swarm_watch
@@ -630,7 +646,7 @@ def _run_codex_worker_watched(index, prompt, workspace, sandbox, model, timeout_
     try:
         os.makedirs(workspace, exist_ok=True)
         ans = codex_bridge.run_codex_streaming(
-            prompt, workspace, sandbox, model, False, timeout_s, on_event, pin=False
+            prompt, workspace, sandbox, model, False, timeout_s, effort, on_event, pin=False
         )
         swarm_watch.worker_finish(index, "done", ans, time.time() - start)
         return WorkerResult(
@@ -791,6 +807,77 @@ def _run_cursor_worker_watched(index, prompt, workspace, sandbox, model, timeout
         )
 
 
+def _run_claude_worker(index, prompt, workspace, sandbox, model, effort, timeout_s) -> WorkerResult:
+    import claude_bridge
+
+    start = time.time()
+    try:
+        os.makedirs(workspace, exist_ok=True)
+        ans = claude_bridge.run_claude(
+            prompt, workspace, sandbox, model, False, timeout_s, effort, pin=False
+        )
+        return WorkerResult(
+            index,
+            True,
+            answer=ans,
+            elapsed=round(time.time() - start, 1),
+            workspace=workspace,
+            backend="claude",
+        )
+    except Exception as e:  # noqa: BLE001 — error isolation: one worker must not sink the swarm
+        return WorkerResult(
+            index,
+            False,
+            error=str(e),
+            elapsed=round(time.time() - start, 1),
+            workspace=workspace,
+            backend="claude",
+        )
+
+
+def _run_claude_worker_watched(
+    index, prompt, workspace, sandbox, model, effort, timeout_s
+) -> WorkerResult:
+    import claude_bridge
+    import server
+    import swarm_watch
+
+    start = time.time()
+    swarm_watch.worker_update(index, status="working", started=start)
+    tool_indices: set[int] = set()
+
+    def on_event(ev: dict) -> None:
+        lines = server._claude_event_to_watch_lines(ev, tool_indices)
+        if lines:
+            t = round(time.time() - start, 1)
+            swarm_watch.worker_append(index, [{"kind": k, "text": x, "t": t} for k, x in lines])
+
+    try:
+        os.makedirs(workspace, exist_ok=True)
+        ans = claude_bridge.run_claude_streaming(
+            prompt, workspace, sandbox, model, False, timeout_s, effort, on_event, pin=False
+        )
+        swarm_watch.worker_finish(index, "done", ans, time.time() - start)
+        return WorkerResult(
+            index,
+            True,
+            answer=ans,
+            elapsed=round(time.time() - start, 1),
+            workspace=workspace,
+            backend="claude",
+        )
+    except Exception as e:  # noqa: BLE001
+        swarm_watch.worker_finish(index, "error", str(e), time.time() - start)
+        return WorkerResult(
+            index,
+            False,
+            error=str(e),
+            elapsed=round(time.time() - start, 1),
+            workspace=workspace,
+            backend="claude",
+        )
+
+
 def swarm_agents(
     tasks,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
@@ -819,13 +906,20 @@ def swarm_agents(
         t = norm[i]
         if t["backend"] == "codex":
             fn = _run_codex_worker_watched if watch else _run_codex_worker
-            return fn(i, t["prompt"], t["workspace"], t["sandbox"], t["model"], timeout_s)
+            return fn(
+                i, t["prompt"], t["workspace"], t["sandbox"], t["model"], t["effort"], timeout_s
+            )
         if t["backend"] == "copilot":
             fn = _run_copilot_worker_watched if watch else _run_copilot_worker
             return fn(i, t["prompt"], t["workspace"], t["sandbox"], t["model"], timeout_s)
         if t["backend"] == "cursor":
             fn = _run_cursor_worker_watched if watch else _run_cursor_worker
             return fn(i, t["prompt"], t["workspace"], t["sandbox"], t["model"], timeout_s)
+        if t["backend"] == "claude":
+            fn = _run_claude_worker_watched if watch else _run_claude_worker
+            return fn(
+                i, t["prompt"], t["workspace"], t["sandbox"], t["model"], t["effort"], timeout_s
+            )
         fn = _run_text_worker_watched if watch else _run_text_worker
         return fn(i, t["prompt"], t["workspace"], t["model"], timeout_s)
 

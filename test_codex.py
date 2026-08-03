@@ -302,6 +302,16 @@ def test_status_rows_codex_ok(monkeypatch):
 # --------------------------------------------------------------------------
 
 
+def test_build_args_effort_passthrough():
+    args = codex_bridge.build_args("p", "ws", "read-only", None, None, "o.txt", effort="xhigh")
+    assert args[args.index("-c") + 1] == 'model_reasoning_effort="xhigh"'
+
+
+def test_build_args_no_effort_by_default():
+    args = codex_bridge.build_args("p", "ws", "read-only", None, None, "o.txt")
+    assert "-c" not in args
+
+
 def test_build_args_json_stream_adds_flag_before_output():
     args = codex_bridge.build_args("p", "ws", "read-only", None, None, "o.txt", json_stream=True)
     assert "--json" in args

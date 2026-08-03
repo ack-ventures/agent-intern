@@ -281,6 +281,7 @@ def build_args(
     resume_session: Optional[str],
     output_file: str,
     json_stream: bool = False,
+    effort: Optional[str] = None,
 ) -> list[str]:
     """argv for `codex exec` (fresh) or `codex exec resume <id>` (continue).
 
@@ -296,6 +297,8 @@ def build_args(
         args += ["resume", resume_session]
     if model:
         args += ["-m", model]
+    if effort:
+        args += ["-c", f'model_reasoning_effort="{effort}"']
     if not resume_session:
         args += ["-s", sandbox, "-C", workspace, "--skip-git-repo-check"]
     if json_stream:
@@ -319,6 +322,7 @@ def run_codex(
     model: Optional[str] = None,
     continue_conv: bool = False,
     timeout_s: int = 180,
+    effort: Optional[str] = None,
     pin: bool = True,
 ) -> str:
     """Run `codex exec` (fresh or resume) and return the final agent message.
@@ -344,7 +348,9 @@ def run_codex(
 
     before = _rollout_names() if (not continue_conv and pin) else set()
     try:
-        args = build_args(prompt, workspace, sandbox, model, resume_session, out_path)
+        args = build_args(
+            prompt, workspace, sandbox, model, resume_session, out_path, effort=effort
+        )
         proc = subprocess.run(
             args,
             cwd=workspace,
@@ -390,6 +396,7 @@ def run_codex_streaming(
     model: Optional[str] = None,
     continue_conv: bool = False,
     timeout_s: int = 180,
+    effort: Optional[str] = None,
     on_event=None,
     pin: bool = True,
 ) -> str:
@@ -411,7 +418,16 @@ def run_codex_streaming(
     fd.close()
 
     before = set() if continue_conv else _rollout_names()
-    args = build_args(prompt, workspace, sandbox, model, resume_session, out_path, json_stream=True)
+    args = build_args(
+        prompt,
+        workspace,
+        sandbox,
+        model,
+        resume_session,
+        out_path,
+        json_stream=True,
+        effort=effort,
+    )
     try:
         proc = subprocess.Popen(
             args,

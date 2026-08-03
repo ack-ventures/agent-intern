@@ -4,7 +4,7 @@
 
 <img src="assets/bridge-animation.svg" width="100%" alt="Claude Code bridging Google Antigravity, OpenAI Codex, GitHub Copilot, and Cursor" />
 
-**Drive four external coding CLIs — Google's [Antigravity](https://antigravity.google/) (Gemini 3.6 Flash), [OpenAI Codex](https://developers.openai.com/codex/), the [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli), and [Cursor](https://cursor.com/cli) — as sub-agents inside [Claude Code](https://claude.com/claude-code). Text answers, image generation, real repo work, and parallel swarms, on quota you already pay for.**
+**Drive five external coding CLIs — Google's [Antigravity](https://antigravity.google/) (Gemini 3.6 Flash), [OpenAI Codex](https://developers.openai.com/codex/), the [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli), [Cursor](https://cursor.com/cli), and [Claude Code](https://claude.com/claude-code) itself — as sub-agents inside [Claude Code](https://claude.com/claude-code). Text answers, image generation, real repo work, and parallel swarms, on quota you already pay for.**
 
 [![CI](https://github.com/SinanTufekci/agent-intern/actions/workflows/ci.yml/badge.svg)](https://github.com/SinanTufekci/agent-intern/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agent-intern?logo=pypi&logoColor=white&color=2ea44f)](https://pypi.org/project/agent-intern/)
@@ -24,10 +24,10 @@
 
 ---
 
-One MCP server, **four backends**. It exposes Google Antigravity, OpenAI Codex, the GitHub
-Copilot CLI, and Cursor to Claude Code as clean MCP tools so you can delegate work to a different model
-family mid-task — without leaving your terminal, and on the subscriptions you already have. Each backend
-is independent: install one, two, three, or all four.
+One MCP server, **five backends**. It exposes Google Antigravity, OpenAI Codex, the GitHub
+Copilot CLI, Cursor, and Claude Code itself to Claude Code as clean MCP tools so you can delegate work
+to a different model family mid-task — without leaving your terminal, and on the subscriptions you
+already have. Each backend is independent: install one, two, three, four, or all five.
 
 - **🛰️ Antigravity (`agy`, Gemini 3.6 Flash High).** Fast, cheap tool-calling — and the **only**
   backend with an image model. Its headless print mode (`agy -p`) historically had a **stdout bug**:
@@ -47,8 +47,15 @@ is independent: install one, two, three, or all four.
   like Codex/Copilot (`--output-format text` prints just the answer), an **agent-enforced** sandbox
   (read-only via `--mode ask`), and a deterministic resume mechanism (the bridge mints each chat's id
   itself via `create-chat`). No image model.
+- **⚡ Claude (`claude -p`, Claude Code).** The Claude Code CLI itself, headless. **Automode by
+  default** (`sandbox="default"` = explicit `--permission-mode auto`). `model` picks the backend — an
+  Anthropic alias/id uses the plain `claude` binary on this Anthropic account, while a **claude-os
+  harness id** (`ds-flash`, `ds`, `k3`, …) runs through the `claude-os` wrapper on that provider's
+  quota (DeepSeek/Kimi/Z.AI). Reads the answer from stdout JSON (`--output-format json`), resumes by a
+  pinned session id (`--resume <id>`, else `--continue`), and has a **tool-level** permission boundary
+  — not an OS sandbox.
 
-All four share the same niceties: a `*_continue` to resume a thread, a [live "watch" window](#watch-mode)
+All five share the same niceties: a `*_continue` to resume a thread, a [live "watch" window](#watch-mode)
 to see the agent work, a unified [`agent_swarm`](#swarm) that runs many tasks in parallel **across
 all backends at once**, and `*_status` diagnostics that spend no quota.
 
@@ -61,7 +68,7 @@ all backends at once**, and `*_status` diagnostics that spend no quota.
 > **best-effort** tool/path permissions (read-only denies the local write/shell tools) — safer than
 > agy, but **not** an OS sandbox like Codex's. `cursor-agent -p` runs headless with `--trust` (and
 > `--force` for writes); its `sandbox` is **agent-enforced** (read-only = `--mode ask`, which makes the
-> write/shell tools unavailable) — best-effort like Copilot, **not** an OS sandbox. In all four cases
+> write/shell tools unavailable) — best-effort like Copilot, **not** an OS sandbox. In all five cases
 > the `workspace` argument is a *starting context*, **not** a security boundary. Only use these with **trusted prompts on trusted
 > content**; for real isolation, run the bridge inside a container or VM. **[Full details →](#security)**
 
@@ -77,24 +84,24 @@ all backends at once**, and `*_status` diagnostics that spend no quota.
 | 📁 **Cross-repo reads** | Point a worker at another project directory and let it read/answer there. |
 | 🔌 **Zero new auth** | Piggybacks the logins you already did — no keys for the bridge to manage. |
 
-## The four backends at a glance
+## The five backends at a glance
 
-The bridge normalizes all four CLIs into the same shape, but they differ where it matters. Pick per task:
+The bridge normalizes all five CLIs into the same shape, but they differ where it matters. Pick per task:
 
-| | 🛰️ **Antigravity** (`agy`) | 🤖 **Codex** (`codex exec`) | 🐙 **Copilot** (`copilot -p`) | ✳️ **Cursor** (`cursor-agent -p`) |
-|---|---|---|---|---|
-| **Model** | Selectable via `model` (agy's `--model`); Gemini 3.6 Flash (High) default (see [Model & auth](#model--auth)) | Selectable via `model` (codex's `-m`) | Selectable via `model` (`--model`) | Selectable via `model` (`--model`), validated against `cursor-agent models` |
-| **Best at** | Fast, cheap tool-calling; quick answers | Heavier reasoning; real code/repo work | Agentic coding; real code/repo work | Agentic coding; wide model menu (GPT/Claude/Grok/Composer) |
-| **Image generation** | ✅ `antigravity_image` (+ `antigravity_image_swarm`) | ❌ no image model | ❌ no image model | ❌ no image model |
-| **Sandbox** | ❌ no real boundary (`--sandbox` blocks only shell) | ✅ real, enforced: `read-only` / `workspace-write` / `danger-full-access` | ⚠️ best-effort: tool/path permissions (`read-only` denies write/shell) — **not** an OS sandbox | ⚠️ agent-enforced: mode/force (`read-only` = `--mode ask`, write/shell tools unavailable) — **not** an OS sandbox |
-| **How the answer is read** | `--output-format json` on agy 1.1.8+ (`stream-json` when watching); else stdout, else scraped from `transcript.jsonl` | Written to a file via `-o/--output-last-message` | stdout (`-s` silent mode) | stdout (`--output-format text`) |
-| **Continue mechanism** | Pins the workspace's conversation id (`--conversation`) | Resumes the session id (`codex exec resume <id>`) | Resumes a self-set session UUID (`--session-id`) | Mints a chat id (`create-chat`) and resumes it (`--resume <id>`) |
-| **Auth** | OS credential store (AI Pro session) | `codex login` (ChatGPT account or API key) | OS credential store (`copilot login`) or a GitHub token env | `cursor-agent login` (OS credential store) or `CURSOR_API_KEY` |
-| **In a swarm** | Runs with an isolated `HOME` to avoid state races | Fresh one-shot — needs no isolation | Fresh one-shot — needs no isolation | Fresh one-shot — needs no isolation |
+| | 🛰️ **Antigravity** (`agy`) | 🤖 **Codex** (`codex exec`) | 🐙 **Copilot** (`copilot -p`) | ✳️ **Cursor** (`cursor-agent -p`) | ⚡ **Claude** (`claude -p`) |
+|---|---|---|---|---|---|
+| **Model** | Selectable via `model` (agy's `--model`); Gemini 3.6 Flash (High) default (see [Model & auth](#model--auth)) | Selectable via `model` (codex's `-m`) | Selectable via `model` (`--model`) | Selectable via `model` (`--model`), validated against `cursor-agent models` | Selectable via `model` — an Anthropic alias/id (plain `claude`) or a claude-os harness id (`ds-flash`, `k3`, …) routing to DeepSeek/Kimi/Z.AI |
+| **Best at** | Fast, cheap tool-calling; quick answers | Heavier reasoning; real code/repo work | Agentic coding; real code/repo work | Agentic coding; wide model menu (GPT/Claude/Grok/Composer) | Your own Claude Code, headless; automode by default; any claude-os provider/model |
+| **Image generation** | ✅ `antigravity_image` (+ `antigravity_image_swarm`) | ❌ no image model | ❌ no image model | ❌ no image model | ❌ no image model |
+| **Sandbox** | ❌ no real boundary (`--sandbox` blocks only shell) | ✅ real, enforced: `read-only` / `workspace-write` / `danger-full-access` | ⚠️ best-effort: tool/path permissions (`read-only` denies write/shell) — **not** an OS sandbox | ⚠️ agent-enforced: mode/force (`read-only` = `--mode ask`, write/shell tools unavailable) — **not** an OS sandbox | ⚠️ tool-level permission modes (`default` = automode; `read-only` = dontAsk allowlist; `workspace-write` = acceptEdits) — **not** an OS sandbox |
+| **How the answer is read** | `--output-format json` on agy 1.1.8+ (`stream-json` when watching); else stdout, else scraped from `transcript.jsonl` | Written to a file via `-o/--output-last-message` | stdout (`-s` silent mode) | stdout (`--output-format text`) | stdout JSON via `--output-format json` (`stream-json` when watching) |
+| **Continue mechanism** | Pins the workspace's conversation id (`--conversation`) | Resumes the session id (`codex exec resume <id>`) | Resumes a self-set session UUID (`--session-id`) | Mints a chat id (`create-chat`) and resumes it (`--resume <id>`) | Resumes the pinned session id (`--resume <id>`), else `--continue` |
+| **Auth** | OS credential store (AI Pro session) | `codex login` (ChatGPT account or API key) | OS credential store (`copilot login`) or a GitHub token env | `cursor-agent login` (OS credential store) or `CURSOR_API_KEY` | `claude auth status` — OAuth (`~/.claude/.credentials.json`) or `ANTHROPIC_API_KEY`; harness models need their token env (`DEEPSEEK_API_KEY`, …) |
+| **In a swarm** | Runs with an isolated `HOME` to avoid state races | Fresh one-shot — needs no isolation | Fresh one-shot — needs no isolation | Fresh one-shot — needs no isolation | Fresh one-shot — needs no isolation |
 
 ## How it works
 
-All four backends run **headless** and one-shot per call; the bridge's job is to get a clean answer
+All five backends run **headless** and one-shot per call; the bridge's job is to get a clean answer
 out of each and hand it to Claude Code as a plain string.
 
 ```mermaid
@@ -166,8 +173,12 @@ itself md5 of the workspace path).
   and run `copilot` then `/login` once (or set a `COPILOT_GITHUB_TOKEN`/`GH_TOKEN` env var).
 - **Cursor:** install `cursor-agent` (`curl https://cursor.com/install -fsSL | bash`) and run
   `cursor-agent login` once (or set a `CURSOR_API_KEY` env var).
+- **Claude:** install the `claude` CLI (Claude Code) and sign in once (OAuth, or set
+  `ANTHROPIC_API_KEY`). Optional — only for harness models: install `claude-os` (the harness) and
+  export its token env vars (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `ZAI_API_KEY`, …) from
+  `~/.secrets` so `model="ds-flash"`/`"k3"` etc. can launch.
 
-You don't need all four — the tools for a missing CLI simply report "not found" via their `*_status`
+You don't need all five — the tools for a missing CLI simply report "not found" via their `*_status`
 tool.
 
 ### Recommended — no clone, you control updates
@@ -235,17 +246,18 @@ Then point Claude Code at the absolute path to `server.py` under `mcpServers` in
 </td></tr>
 </table>
 
-Restart Claude Code. **Fifteen tools** appear, each prefixed `mcp__agent-intern__`:
+Restart Claude Code. **Eighteen tools** appear, each prefixed `mcp__agent-intern__`:
 
 - **Antigravity (5):** `antigravity_ask`, `antigravity_continue`, `antigravity_image`,
   `antigravity_image_swarm`, `antigravity_status`
 - **Codex (3):** `codex_ask`, `codex_continue`, `codex_status`
 - **Copilot (3):** `copilot_ask`, `copilot_continue`, `copilot_status`
 - **Cursor (3):** `cursor_ask`, `cursor_continue`, `cursor_status`
-- **Shared (1):** `agent_swarm` — fans a list of tasks out across **all four** backends in one run
+- **Claude (3):** `claude_ask`, `claude_continue`, `claude_status`
+- **Shared (1):** `agent_swarm` — fans a list of tasks out across **all five** backends in one run
 
-The single-prompt tools — Antigravity, Codex, Copilot, **and** Cursor — take a **`watch=true`** flag
-for the live browser view ([Watch mode](#watch-mode)).
+The single-prompt tools — Antigravity, Codex, Copilot, Cursor, **and** Claude — take a **`watch=true`**
+flag for the live browser view ([Watch mode](#watch-mode)).
 
 > [!NOTE]
 > **Your client learns how to use the bridge on its own.** The server ships MCP *instructions* — a
@@ -275,8 +287,8 @@ do the same.
 
 | Tool | Purpose |
 |---|---|
-| `codex_ask(prompt, workspace?, sandbox?="read-only", model?, timeout_s?=180, watch?=false)` | Start a **new** Codex session. `sandbox` is a **real** boundary (see [Codex bridge](#codex-bridge)); `model` selects the model (`-m`). `watch=true` opens the live view, streaming codex's steps from its `--json` event stream. |
-| `codex_continue(prompt, workspace?, timeout_s?=180, watch?=false)` | Continue the Codex session **rooted at `workspace`** — resumes the exact session id, falling back to the newest on-disk session for that cwd after a server restart. The resumed session keeps its original sandbox and model. `watch=true` opens the live view. |
+| `codex_ask(prompt, workspace?, sandbox?="read-only", model?, effort?, timeout_s?=180, watch?=false)` | Start a **new** Codex session. `sandbox` is a **real** boundary (see [Codex bridge](#codex-bridge)); `model` selects the model (`-m`); `effort` overrides reasoning effort (`-c model_reasoning_effort=...`, e.g. `"xhigh"`). `watch=true` opens the live view, streaming codex's steps from its `--json` event stream. |
+| `codex_continue(prompt, workspace?, effort?, timeout_s?=180, watch?=false)` | Continue the Codex session **rooted at `workspace`** — resumes the exact session id, falling back to the newest on-disk session for that cwd after a server restart. The resumed session keeps its original sandbox and model. `watch=true` opens the live view. |
 | `codex_status()` | Setup diagnostics: codex version, login status (`codex login status`), sessions dir. Spends no quota. |
 
 ### 🐙 Copilot
@@ -295,11 +307,19 @@ do the same.
 | `cursor_continue(prompt, workspace?, sandbox?="read-only", timeout_s?=180, watch?=false)` | Continue the Cursor chat **rooted at `workspace`** — resumes the exact chat id the bridge minted (`create-chat` + `--resume`), falling back to the newest on-disk chat for that cwd after a restart. `watch=true` opens the live view. |
 | `cursor_status()` | Setup diagnostics: **the bridge's own version + whether a newer release is available**, plus cursor version and login status (`cursor-agent status`). Spends no quota. |
 
+### ⚡ Claude
+
+| Tool | Purpose |
+|---|---|
+| `claude_ask(prompt, workspace?, sandbox?="default", model?, effort?, timeout_s?=180, watch?=false)` | Run the Claude Code CLI headlessly (`claude -p`) in a **new** session. `prompt` must be **explicit and self-contained** — the sub-agent has no shared context with you. `sandbox="default"` is **automode**; `"read-only"`/`"workspace-write"`/`"danger-full-access"` force a tool-level permission mode (**not** an OS sandbox — see [Claude bridge](#claude-bridge)). `model` picks the backend (Anthropic alias/id, or a claude-os harness id like `ds-flash`); `effort` overrides reasoning effort (`--effort`, e.g. `"xhigh"`). `watch=true` opens the live view, streaming claude's steps from its `stream-json` output. |
+| `claude_continue(prompt, workspace?, sandbox?="default", model?, effort?, timeout_s?=180, watch?=false)` | Continue the Claude session **rooted at `workspace`** — resumes the pinned session id (`--resume <id>`), else `--continue`. claude re-applies flags every run, so pass the same `sandbox`/`model`/`effort` you used on `claude_ask`. `prompt` must be explicit. `watch=true` opens the live view. |
+| `claude_status()` | Setup diagnostics: `claude` version, auth status (`claude auth status`), the claude-os harness (installed? models? token envs?), projects dir, pinned sessions. Spends no quota. |
+
 ### 🐝 Shared
 
 | Tool | Purpose |
 |---|---|
-| `agent_swarm(tasks, max_concurrency?=4, timeout_s?=180, watch?=false)` | Run **several tasks in parallel across all four backends** — each task names its `backend` (`antigravity`, `codex`, `copilot`, or `cursor`) plus a `prompt` (an optional `model` for any backend, and `sandbox` for Codex/Copilot/Cursor). Every answer comes back in one block; `watch=true` opens the live dashboard ([Swarm](#swarm)). |
+| `agent_swarm(tasks, max_concurrency?=4, timeout_s?=180, watch?=false)` | Run **several tasks in parallel across all five backends** — each task names its `backend` (`antigravity`, `codex`, `copilot`, `cursor`, or `claude`) plus a `prompt` (an optional `model` for any backend, and `sandbox` for Codex/Copilot/Cursor/Claude). Every answer comes back in one block; `watch=true` opens the live dashboard ([Swarm](#swarm)). |
 
 `workspace` defaults to the MCP server's current working directory. Point it at a real project dir
 for context-aware answers — every backend gives the model access to files under that root (Codex,
@@ -326,7 +346,7 @@ fixed its stdout). Three things make Codex worth reaching for over Antigravity:
   interactive approval gate, so this flag **is** your safety boundary — opt into write access
   deliberately.
 - **Model selection works.** `model` maps to codex's `-m`. (agy's `--model` works in print mode too
-  as of 1.0.16; all four backends now expose the same `model` knob.)
+  as of 1.0.16; all five backends now expose the same `model` knob.)
 - **Stronger reasoning.** Codex is a coding agent, not an image model — there's no `codex_image`. Its
   strength is reasoning and real code/repo work; hand it the jobs that need a heavier model.
 
@@ -569,7 +589,7 @@ quota/rate-limit pressure for wall-clock.
 
 ## ⚠️ Security
 
-All four backends run the model as an **autonomous agent**. The difference is whether you get a real
+All five backends run the model as an **autonomous agent**. The difference is whether you get a real
 boundary: Codex enforces one, Copilot and Cursor offer best-effort ones, Antigravity offers none.
 
 ### Antigravity — no usable boundary
@@ -646,6 +666,31 @@ maps to cursor's mode/force flags — an **agent-enforced**, not OS-level, bound
 
 For a **hard** read-only boundary, prefer `codex_ask`.
 
+### Claude — tool-level permission modes
+
+`claude -p` runs headless with an explicit `--permission-mode`. Its `sandbox` maps to a **tool-level
+permission boundary** — it restricts which tools claude may use and auto-approve, **not** an OS-level
+filesystem sandbox:
+
+- **`default`** — explicit `--permission-mode auto` (automode): claude auto-classifies each request
+  and approves on its own judgment, matching your normal interactive Claude Code. The agent can write
+  files and run commands it deems safe. This is the default, so the claude backend is NOT read-only
+  out of the box.
+- **`read-only`** — `--permission-mode dontAsk` with an allowlist of read-only tools
+  (`Read`, `Glob`, `Grep`, `Ls`, `WebSearch`, `WebFetch`): no writes, no shell. The closest this
+  backend has to a hard boundary (still not an OS sandbox).
+- **`workspace-write`** — `--permission-mode acceptEdits` (Write/Edit + common fs commands auto-
+  approved) plus scoped read-only `git` Bash rules. Deliberately **no unrestricted Bash**.
+- **`danger-full-access`** — `--dangerously-skip-permissions`. Avoid.
+
+Two extra postures the claude backend takes regardless of `sandbox`:
+- **Explicit-direction contract:** `claude_ask`/`claude_continue` require a **self-contained,
+  explicit prompt** (what to do, which files, constraints, expected output) — the sub-agent has no
+  shared context with the coordinator.
+- **Recursion guard:** every inner `claude -p` runs with `--strict-mcp-config --mcp-config "{}"`, so
+  it loads NO MCP servers and cannot re-enter agent-intern to spawn nested claude sessions. Set
+  `CLAUDE_BRIDGE_INHERIT_MCP=1` to disable this (then the inner session keeps its normal MCP config).
+
 ### What that means for you
 
 - The `workspace` argument is only a *starting context*, **not a security boundary** — Antigravity
@@ -674,7 +719,7 @@ staying within them.
 </details>
 
 <details>
-<summary><b>Do I need all four CLIs?</b></summary>
+<summary><b>Do I need all five CLIs?</b></summary>
 
 No. Each backend is independent — install only the CLI(s) you want. The tools for a missing backend
 report "not found" via their `*_status` tool (`antigravity_status` / `codex_status` /
@@ -691,8 +736,8 @@ only backend with an image model) — and it now lets you **pick the model** too
 second coding opinion alongside Codex — noting its sandbox is **best-effort**, not enforced. Use
 **Cursor** for agentic coding on a Cursor plan, or when you want the **widest model menu** —
 GPT, Claude, Grok, and Composer, all via `model` — noting its sandbox is **agent-enforced**, like
-Copilot's. All four let you choose a `model`; in a swarm you can mix all four. See
-[The four backends at a glance](#the-four-backends-at-a-glance).
+Copilot's. All five let you choose a `model`; in a swarm you can mix all five. See
+[The five backends at a glance](#the-five-backends-at-a-glance).
 </details>
 
 <details>

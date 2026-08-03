@@ -336,6 +336,7 @@ from typing import Optional
 
 from fastmcp import Context, FastMCP
 
+import claude_bridge
 import codex_bridge
 import copilot_bridge
 import cursor_bridge
@@ -349,11 +350,11 @@ import cursor_bridge
 # value content here is what a model can't infer from tool schemas alone —
 # proactive triggers, which backend to pick, and the workspace footgun.
 SERVER_INSTRUCTIONS = """\
-This server bridges four external coding CLIs — Antigravity (Gemini), OpenAI \
-Codex, GitHub Copilot, and Cursor — into your session as sub-agents that run on \
-the USER'S OWN quota. Delegating here spends their Gemini/Codex/Copilot/Cursor \
-quota instead of your tokens, gets a second model-family opinion, or generates \
-images.
+This server bridges five external coding CLIs — Antigravity (Gemini), OpenAI \
+Codex, GitHub Copilot, Cursor, and Claude Code — into your session as sub-agents \
+that run on the USER'S OWN quota. Delegating here spends their Gemini/Codex/\
+Copilot/Cursor/Anthropic quota instead of your tokens, gets a second model-family \
+opinion, or generates images.
 
 Reach for these tools when:
 - the user wants an IMAGE — antigravity_image is your only image generator \
@@ -376,11 +377,20 @@ not an OS boundary.
 - cursor_* (Cursor) — agentic coding on a Cursor plan, with a wide model menu \
 (GPT/Claude/Grok/Composer via `model`); sandbox is agent-enforced (read-only = \
 ask mode), not an OS boundary.
+- claude_* (Claude Code) — the Claude Code CLI itself, headless. Automode by \
+default (sandbox="default"); `model` picks the backend: an Anthropic model \
+spends the SAME Anthropic quota as this session, while a claude-os harness id \
+("ds-flash", "k3", or one from ~/.config/claude-os/models.txt) runs on that \
+provider's quota (DeepSeek/Kimi/etc.). Permission boundary is tool-level, not an \
+OS sandbox.
 
 Mechanics:
 - Pass `workspace` = the relevant project directory. It defaults to the server's \
 cwd, so WITHOUT it the sub-agent answers with no repo context — this is the most \
 common mistake.
+- claude_* prompts must be EXPLICIT and SELF-CONTAINED — what to do, which files \
+to touch, constraints, the expected output. The sub-agent has no shared context \
+with you.
 - *_continue resumes the thread rooted at a workspace; swarm workers are \
 one-shot (no continue).
 - watch=true opens a live browser view of the agent working (identical return \
@@ -388,8 +398,8 @@ value).
 - *_status checks a backend is installed and logged in, and spends no quota — \
 use it if a call reports "not found".
 
-Security: all three run as autonomous agents and only Codex's sandbox is a hard \
-boundary. Use only with trusted prompts on trusted content."""
+Security: all five run as autonomous agents and only Codex's sandbox is a hard \
+OS boundary. Use only with trusted prompts on trusted content."""
 
 mcp = FastMCP("agent-intern", instructions=SERVER_INSTRUCTIONS)
 
@@ -397,7 +407,7 @@ mcp = FastMCP("agent-intern", instructions=SERVER_INSTRUCTIONS)
 # installed package metadata, which goes stale on editable installs). Keep in
 # sync with pyproject.toml's version. Compared at startup against the latest
 # tag on GitHub so a long-lived clone learns when to `git pull`.
-__version__ = "0.22.1"
+__version__ = "0.23.0"
 
 # Logs go to stderr (stdout is the MCP protocol channel). Quiet by default;
 # set AGY_BRIDGE_DEBUG=1 for per-call diagnostics. See _configure_logging.
@@ -2723,7 +2733,7 @@ def _broadcast_workspaces(workspaces: Optional[list], n: int):
 
 @mcp.tool(
     annotations={
-        "title": "Agent swarm (mixed Antigravity + Codex + Copilot + Cursor, parallel)",
+        "title": "Agent swarm (mixed Antigravity + Codex + Copilot + Cursor + Claude, parallel)",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
@@ -2738,10 +2748,10 @@ def agent_swarm(
     """Run SEVERAL tasks IN PARALLEL across ALL backends in a single swarm.
 
     Each task is its own worker and names the backend to run on, so one swarm can
-    mix Antigravity (Gemini), Codex, Copilot, and Cursor workers — they run truly
-    concurrently (capped at `max_concurrency`) and every answer comes back in one
-    labelled block. A worker that fails is reported in place; the others still
-    return.
+    mix Antigravity (Gemini), Codex, Copilot, Cursor, and Claude workers — they
+    run truly concurrently (capped at `max_concurrency`) and every answer comes
+    back in one labelled block. A worker that fails is reported in place; the
+    others still return.
 
     SECURITY: this launches N unsandboxed agents at once — N times the
     prompt-injection surface of a single call (see the module SECURITY note). Only
@@ -2750,19 +2760,27 @@ def agent_swarm(
     Args:
         tasks: One object per parallel worker:
                - backend: "antigravity" (alias "agy"/"gemini"), "codex",
-                          "copilot" (alias "gh"/"github"), or "cursor" (required)
+                          "copilot" (alias "gh"/"github"), "cursor", or "claude"
+                          (alias "anthropic") (required)
                - prompt:  the question or instruction (required)
                - workspace: working dir for that worker (default: server cwd)
-               - sandbox: Codex/Copilot/Cursor only — "read-only" (default),
-                          "workspace-write", or "danger-full-access". Ignored for
-                          Antigravity. (Codex's is an enforced OS sandbox; Copilot's
-                          and Cursor's are agent/tool-level, not OS boundaries — see
-                          copilot_ask / cursor_ask.)
+               - sandbox: Codex/Copilot/Cursor/Claude only — "read-only"
+                          (default), "workspace-write", or "danger-full-access".
+                          Ignored for Antigravity. (Codex's is an enforced OS
+                          sandbox; Copilot's, Cursor's, and Claude's are
+                          agent/tool-level, not OS boundaries — see copilot_ask /
+                          cursor_ask / claude_ask. Claude's default is
+                          sandbox="default" = automode.)
                - model:   optional model override for ANY backend — Codex's `-m`,
-                          Copilot's/Cursor's `--model`, or Antigravity's `--model`
-                          (an agy slug like "claude-sonnet-4-6"; validated
-                          against each backend's model list). Omit for each
-                          backend's default.
+                          Copilot's/Cursor's `--model`, Antigravity's `--model`
+                          (an agy slug like "claude-sonnet-4-6"), or Claude's
+                          harness routing (an Anthropic alias/id, or a claude-os
+                          model id like "ds-flash"). Validated against each
+                          backend's model list. Omit for each backend's default.
+               - effort:  optional reasoning-effort override for Codex and Claude
+                          only (codex `-c model_reasoning_effort=...`, claude
+                          `--effort`; e.g. "xhigh"). Omit for each backend's
+                          default.
         max_concurrency: Max workers running at once (default 4). Higher = faster
                          but more quota/rate-limit pressure and more agents at once.
         timeout_s: Per-worker timeout in seconds. Default 180.
@@ -2869,6 +2887,7 @@ async def codex_ask(
     workspace: Optional[str] = None,
     sandbox: str = codex_bridge.DEFAULT_SANDBOX,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     timeout_s: int = 180,
     watch: bool = False,
     ctx: Optional[Context] = None,
@@ -2890,6 +2909,9 @@ async def codex_ask(
                  exec` has no interactive approval gate, so this is the real safety
                  boundary; opt into write access deliberately.
         model: Optional model override (`-m`); omit to use codex's configured default.
+        effort: Optional reasoning effort override (`-c model_reasoning_effort=...`,
+                e.g. "low" | "medium" | "high" | "xhigh"); omit to use codex's
+                configured default.
         timeout_s: Max seconds to wait for codex to complete. Default 180.
         watch: If true, open a live "watch" view in your browser that streams
                codex's steps (reasoning, the commands it runs, file changes) from
@@ -2901,11 +2923,11 @@ async def codex_ask(
     codex_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
     if watch:
         return await asyncio.to_thread(
-            _run_codex_watched, prompt, ws, sandbox, model, False, timeout_s
+            _run_codex_watched, prompt, ws, sandbox, model, False, timeout_s, effort
         )
     return await _run_with_progress(
         codex_bridge.run_codex,
-        (prompt, ws, sandbox, model, False, timeout_s),
+        (prompt, ws, sandbox, model, False, timeout_s, effort),
         ctx,
         timeout_s,
         label="codex",
@@ -2923,6 +2945,7 @@ async def codex_ask(
 async def codex_continue(
     prompt: str,
     workspace: Optional[str] = None,
+    effort: Optional[str] = None,
     timeout_s: int = 180,
     watch: bool = False,
     ctx: Optional[Context] = None,
@@ -2938,6 +2961,7 @@ async def codex_continue(
     Args:
         prompt: Follow-up message for the existing session.
         workspace: Working root used by the prior session. Defaults to the server cwd.
+        effort: Optional reasoning effort override, same values as codex_ask.
         timeout_s: Max seconds to wait for codex to complete. Default 180.
         watch: If true, open the live "watch" view streaming codex's steps as it
                works (same viewer as codex_ask). Default false.
@@ -2952,10 +2976,11 @@ async def codex_continue(
             None,
             True,
             timeout_s,
+            effort,
         )
     return await _run_with_progress(
         codex_bridge.run_codex,
-        (prompt, ws, codex_bridge.DEFAULT_SANDBOX, None, True, timeout_s),
+        (prompt, ws, codex_bridge.DEFAULT_SANDBOX, None, True, timeout_s, effort),
         ctx,
         timeout_s,
         label="codex",
@@ -3029,6 +3054,7 @@ def _run_codex_watched(
     model: Optional[str],
     continue_conv: bool,
     timeout_s: int,
+    effort: Optional[str] = None,
 ) -> str:
     """Like codex_bridge.run_codex, but stream codex's steps to the live watch
     window. EXPERIMENTAL. Reuses the same localhost viewer as the agy watch tools;
@@ -3054,7 +3080,7 @@ def _run_codex_watched(
 
     try:
         answer = codex_bridge.run_codex_streaming(
-            prompt, workspace, sandbox, model, continue_conv, timeout_s, on_event
+            prompt, workspace, sandbox, model, continue_conv, timeout_s, effort, on_event
         )
     except Exception as e:  # noqa: BLE001 — show the failure in the window, then re-raise
         _watch_finish(rid, "error", f"({e})"[:200], time.time() - start)
@@ -3511,6 +3537,261 @@ def _run_cursor_watched(
     except Exception as e:  # noqa: BLE001 — show the failure in the window, then re-raise
         _watch_finish(rid, "error", f"({e})"[:200], time.time() - start)
         raise
+    _watch_finish(rid, "done", answer, time.time() - start)
+    return answer
+
+
+@mcp.tool(
+    annotations={
+        "title": "Ask Claude Code (new session)",
+        "readOnlyHint": False,  # claude may edit files under automode / write sandboxes
+        "idempotentHint": False,
+        "openWorldHint": True,  # talks to the external Claude Code / harness service
+    }
+)
+async def claude_ask(
+    prompt: str,
+    workspace: Optional[str] = None,
+    sandbox: str = claude_bridge.DEFAULT_SANDBOX,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    timeout_s: int = 180,
+    watch: bool = False,
+    ctx: Optional[Context] = None,
+) -> str:
+    """Run the Claude Code CLI headlessly (`claude -p`) in a NEW session.
+
+    PROMPT MUST BE EXPLICIT AND SELF-CONTAINED — state what to do, which files to
+    touch, any constraints, and the expected output. The sub-agent has no shared
+    context with you; a terse one-liner wastes the call.
+
+    Runs in automode by default (sandbox="default"); pass sandbox="read-only" for
+    a real boundary. `model` picks the backend: an Anthropic model (fable/opus/
+    sonnet/haiku or claude-*) uses the plain `claude` CLI on this Anthropic
+    account; any claude-os harness id (e.g. "ds-flash", "ds", "k3", or an id from
+    ~/.config/claude-os/models.txt) runs through the claude-os harness on that
+    provider's quota (DeepSeek/Kimi/etc.).
+
+    Args:
+        prompt: Explicit, self-contained instructions for the sub-agent.
+        workspace: Working root for the session. Defaults to the server cwd.
+        sandbox: "default" (automode), "read-only", "workspace-write", or
+                 "danger-full-access".
+        model: Anthropic model alias/id, or a claude-os harness model id.
+        effort: Optional effort override (`--effort`, e.g. "low" | "medium" |
+                "high" | "xhigh" | "max"); omit to use the default.
+        timeout_s: Max seconds to wait for claude to complete. Default 180.
+        watch: If true, open a live "watch" view in your browser that streams
+               claude's steps from its stream-json output. claude still runs
+               headless; the same final text is returned. Default false.
+    """
+    ws = claude_bridge.normalize_workspace(workspace)
+    claude_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
+    claude_bridge.validate_model(model)  # fail fast on a typo'd harness id
+    if watch:
+        return await asyncio.to_thread(
+            _run_claude_watched, prompt, ws, sandbox, model, False, timeout_s, effort
+        )
+    return await _run_with_progress(
+        claude_bridge.run_claude,
+        (prompt, ws, sandbox, model, False, timeout_s, effort),
+        ctx,
+        timeout_s,
+        label="claude",
+    )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Continue Claude Code session",
+        "readOnlyHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def claude_continue(
+    prompt: str,
+    workspace: Optional[str] = None,
+    sandbox: str = claude_bridge.DEFAULT_SANDBOX,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    timeout_s: int = 180,
+    watch: bool = False,
+    ctx: Optional[Context] = None,
+) -> str:
+    """Continue the Claude Code session rooted at this workspace (`--resume`).
+
+    Resumes the exact session id captured from the last claude_ask in this
+    workspace, falling back to `--continue` (claude's most-recent-conversation
+    pick) when the pin is gone. PROMPT MUST BE EXPLICIT AND SELF-CONTAINED — the
+    resumed session has only its own prior turns, not your context.
+
+    claude re-applies flags on every headless invocation, so pass the same
+    `sandbox` and `model` you used on the original claude_ask (a different
+    sandbox/model here changes what THIS run may do).
+
+    Args:
+        prompt: Explicit follow-up instructions for the existing session.
+        workspace: Working root used by the prior session. Defaults to the server cwd.
+        sandbox: Same values as claude_ask; re-applied this run.
+        model: Same values as claude_ask; re-applied this run.
+        effort: Same values as claude_ask; re-applied this run.
+        timeout_s: Max seconds to wait for claude to complete. Default 180.
+        watch: If true, open the live "watch" view streaming claude's steps as it
+               works (same viewer as claude_ask). Default false.
+    """
+    ws = claude_bridge.normalize_workspace(workspace)
+    claude_bridge.validate_sandbox(sandbox)
+    claude_bridge.validate_model(model)  # fail fast on a typo'd harness id
+    if watch:
+        return await asyncio.to_thread(
+            _run_claude_watched, prompt, ws, sandbox, model, True, timeout_s, effort
+        )
+    return await _run_with_progress(
+        claude_bridge.run_claude,
+        (prompt, ws, sandbox, model, True, timeout_s, effort),
+        ctx,
+        timeout_s,
+        label="claude",
+    )
+
+
+@mcp.tool(
+    annotations={
+        "title": "Claude Code bridge diagnostics",
+        "readOnlyHint": True,  # only runs --version / auth status / reads config
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def claude_status() -> str:
+    """Report diagnostics for the Claude Code bridge setup (spends no quota).
+
+    Reports the bridge's own version and whether a newer release is available
+    (same update notice the other status tools show), then checks whether the
+    `claude` CLI is on PATH (and its version), whether you're authenticated
+    (`claude auth status` — no model call), where sessions are stored, whether the
+    claude-os harness is installed and which models/tokens it can reach, and how
+    many workspace sessions are pinned this run. Use this to debug "claude not
+    found", auth errors, or a harness model that won't launch before spending
+    quota.
+    """
+    rows = [_bridge_version_status()] + claude_bridge.status_rows()
+    width = max(len(label) for label, _, _ in rows)
+    lines = ["claude bridge status"]
+    for label, ok, detail in rows:
+        mark = "ok" if ok else "!!"
+        lines.append(f"  {label.ljust(width)}  [{mark}] {detail}")
+    lines.append("Overall: " + ("OK" if all(ok for _, ok, _ in rows) else "PROBLEMS FOUND"))
+    return "\n".join(lines)
+
+
+def _claude_event_to_watch_lines(
+    ev: dict, tool_indices: Optional[set[int]] = None
+) -> list[tuple[str, str]]:
+    """Map one claude stream-json event to (kind, text) watch lines
+    (kind is 'narration' | 'command' | 'result'), mirroring
+    _cursor_event_to_watch_lines. Returns [] for events not worth showing.
+
+    `tool_indices` is an optional per-watch set tracking which content-block
+    indices are tool_use blocks. content_block_stop events carry only an index,
+    not the block type, so a text block's stop would otherwise read as a fake
+    "done" — only a tracked tool block gets one.
+    """
+    etype = ev.get("type")
+    if etype == "assistant":
+        content = (ev.get("message") or {}).get("content") or []
+        txt = "".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        ).strip()
+        return [("narration", txt.splitlines()[0][:200])] if txt else []
+    if etype == "stream_event":
+        event = ev.get("event") or {}
+        etype2 = event.get("type")
+        idx = event.get("index")
+        if etype2 == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                if tool_indices is not None and isinstance(idx, int):
+                    tool_indices.add(idx)
+                name = (block.get("name") or "").strip()
+                inp = block.get("input") or {}
+                brief = ""
+                if isinstance(inp, dict) and inp:
+                    brief = " " + json.dumps(inp)[:160]
+                line = f"{name}{brief}".strip()
+                return [("command", line[:200])] if line else []
+        if etype2 == "content_block_stop":
+            if tool_indices is not None and isinstance(idx, int) and idx in tool_indices:
+                tool_indices.discard(idx)
+                return [("result", "done")]
+        return []
+    if etype == "error":
+        msg = ev.get("message") or (ev.get("error") or {}).get("message") or ""
+        return [("result", f"error: {msg}"[:200])]
+    if etype == "result" and ev.get("is_error"):
+        return [("result", "error")]
+    return []
+
+
+def _run_claude_watched(
+    prompt: str,
+    workspace: str,
+    sandbox: str,
+    model: Optional[str],
+    continue_conv: bool,
+    timeout_s: int,
+    effort: Optional[str] = None,
+) -> str:
+    """Like claude_bridge.run_claude, but stream claude's steps to the live watch
+    window. EXPERIMENTAL. Reuses the same localhost viewer as the other backends'
+    watch tools; the return value is identical to claude_ask.
+    """
+    start = time.time()
+    title = prompt.strip().splitlines()[0] if prompt.strip() else ""
+    if len(title) > 200:
+        title = title[:200].rsplit(" ", 1)[0] + "…"
+    history = claude_bridge.read_history(workspace, continue_conv)
+    rid = _watch_begin(title, start, timeout_s, backend="claude", prompt=prompt, history=history)
+    try:
+        port = _ensure_watch_server()
+        _open_watch_window(f"http://127.0.0.1:{port}/?id={rid}", rid)
+    except Exception:  # noqa: BLE001 — the viewer is best-effort, never fatal
+        pass
+
+    buf: list[str] = []
+    tool_indices: set[int] = set()
+
+    def on_event(ev: dict) -> None:
+        nonlocal buf
+        # Buffer text_delta fragments into narration lines so the answer text
+        # appears live without flooding the viewer with one line per token.
+        if ev.get("type") == "stream_event":
+            delta = ((ev.get("event") or {}).get("delta") or {}).get("text")
+            if isinstance(delta, str):
+                buf.append(delta)
+                joined = "".join(buf)
+                if "\n" in joined or len(joined) >= 200:
+                    t = round(time.time() - start, 1)
+                    _watch_append(rid, [{"kind": "narration", "text": joined[:200], "t": t}])
+                    buf = []
+        watch_lines = _claude_event_to_watch_lines(ev, tool_indices)
+        if watch_lines:
+            t = round(time.time() - start, 1)
+            _watch_append(rid, [{"kind": k, "text": x, "t": t} for k, x in watch_lines])
+
+    try:
+        answer = claude_bridge.run_claude_streaming(
+            prompt, workspace, sandbox, model, continue_conv, timeout_s, effort, on_event
+        )
+    except Exception as e:  # noqa: BLE001 — show the failure in the window, then re-raise
+        _watch_finish(rid, "error", f"({e})"[:200], time.time() - start)
+        raise
+    if buf:
+        _watch_append(
+            rid,
+            [{"kind": "narration", "text": "".join(buf)[:200], "t": round(time.time() - start, 1)}],
+        )
     _watch_finish(rid, "done", answer, time.time() - start)
     return answer
 

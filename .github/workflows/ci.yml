@@ -41,4 +41,10 @@ jobs:
         run: ruff format --check .
 
       - name: Unit tests (offline — no agy, no quota)
-        run: pytest test_server.py test_swarm.py test_codex.py test_copilot.py test_cursor.py -q
+        run: pytest test_server.py test_swarm.py test_codex.py test_copilot.py test_cursor.py test_claude.py -q
+
+      - name: Package build smoke (sdist + wheel include every bridge module)
+        run: |
+          pip install build
+          python -m build
+          python -c "import glob, zipfile; w=glob.glob('dist/*.whl')[0]; z=zipfile.ZipFile(w); names=z.namelist(); assert all(m in names for m in ('claude_bridge.py','codex_bridge.py','copilot_bridge.py','cursor_bridge.py','server.py','swarm.py','swarm_watch.py'))"

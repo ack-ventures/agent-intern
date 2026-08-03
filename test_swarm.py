@@ -265,6 +265,19 @@ def test_normalize_tasks_codex_default_sandbox():
     assert out[0]["sandbox"] == codex_bridge.DEFAULT_SANDBOX
 
 
+def test_normalize_tasks_effort_only_for_codex_and_claude():
+    out = swarm._normalize_tasks(
+        [
+            {"backend": "codex", "prompt": "a", "effort": "xhigh"},
+            {"backend": "claude", "prompt": "b", "effort": "high"},
+            {"backend": "copilot", "prompt": "c", "effort": "medium"},  # not exposed -> dropped
+        ]
+    )
+    assert out[0]["effort"] == "xhigh"
+    assert out[1]["effort"] == "high"
+    assert out[2]["effort"] is None
+
+
 def test_normalize_tasks_antigravity_honors_model_drops_sandbox(monkeypatch):
     import server
 
@@ -324,7 +337,7 @@ def test_swarm_agents_dispatches_by_backend(monkeypatch):
         calls.append(("antigravity", index, prompt, model))
         return swarm.WorkerResult(index, True, answer="agy:" + prompt, workspace=workspace)
 
-    def fake_codex(index, prompt, workspace, sandbox, model, timeout_s):
+    def fake_codex(index, prompt, workspace, sandbox, model, effort, timeout_s):
         calls.append(("codex", index, prompt, sandbox, model))
         return swarm.WorkerResult(index, True, answer="cdx:" + prompt, workspace=workspace)
 
@@ -381,12 +394,12 @@ def test_run_codex_worker_never_pins(monkeypatch):
 
     seen = {}
 
-    def fake_run(prompt, ws, sandbox, model, cont, t, pin=True):
+    def fake_run(prompt, ws, sandbox, model, cont, t, effort, pin=True):
         seen["pin"] = pin
         return "ans:" + prompt
 
     monkeypatch.setattr(codex_bridge, "run_codex", fake_run)
-    r = swarm._run_codex_worker(0, "hello", os.getcwd(), "read-only", None, 5)
+    r = swarm._run_codex_worker(0, "hello", os.getcwd(), "read-only", None, None, 5)
     assert r.ok and r.answer == "ans:hello" and r.backend == "codex"
     assert seen["pin"] is False
 

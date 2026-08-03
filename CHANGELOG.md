@@ -10,6 +10,51 @@ summary.
 
 ## [Unreleased]
 
+### Added
+
+- **New backend: the Claude Code CLI (`claude -p`)** — `claude_ask`, `claude_continue`, and
+  `claude_status` MCP tools, full `agent_swarm` + watch-mode support, on the uniform bridge
+  interface. Reads the answer from stdout JSON (`--output-format json`), resumes by pinned session
+  id (`--resume <id>`, else `--continue`), and runs the inner claude with a **recursion guard**
+  (`--strict-mcp-config --mcp-config "{}"` so it never loads agent-intern itself; disable with
+  `CLAUDE_BRIDGE_INHERIT_MCP=1`).
+- **Harness routing.** `claude_*`'s `model` param selects the backend: an Anthropic alias/id uses
+  the plain `claude` binary (this Anthropic account); a claude-os harness id (`ds-flash`, `ds`,
+  `k3`, `claude-ds`, … or any id from `~/.config/claude-os/models.txt`) runs through the `claude-os`
+  wrapper on that provider's quota (DeepSeek/Kimi/Z.AI). Shorthand aliases included; unknown ids
+  fail fast with the available list.
+- **Effort knob on claude and codex.** `claude_ask`/`claude_continue` take `effort` (mapped to
+  `--effort`, e.g. `"xhigh"`); `codex_ask`/`codex_continue` take `effort` (mapped to
+  `-c model_reasoning_effort="<level>"`). Threaded through the swarm worker path too.
+- **Automode by default.** `claude_*` default sandbox is `"default"` = explicit
+  `--permission-mode auto`; `"read-only"`/`"workspace-write"`/`"danger-full-access"` force a
+  tool-level permission mode (deliberately no unrestricted Bash anywhere). None is an OS sandbox.
+- **Explicit-direction contract.** `claude_ask`/`claude_continue` docstrings and the server
+  instructions require a self-contained, explicit prompt (the sub-agent has no shared context).
+- **Quota-free status.** `claude_status` reports the CLI version, `claude auth status`, and the
+  claude-os harness (installed, models loaded, endpoint token env vars set).
+
+### Fixed
+
+- **`claude-ds` / `claude-ds-flash` / `claude-k3` (and bare `claude-os`) were routed to plain
+  `claude` instead of the claude-os harness.** The Anthropic `claude-*` prefix rule fired before the
+  harness-alias lookup, so a documented harness alias ran `claude --model claude-ds` against
+  Anthropic. Harness aliases and the bare harness name are now resolved before the first-party rule.
+- **Watch mode no longer emits a fake "done" for every text-block stop.** `content_block_stop`
+  events carry only an index; the converter now tracks tool-use block indices so "done" fires only
+  for a tool block.
+- **`claude_ask`/`claude_continue` now fail fast on a typo'd harness model id** (`validate_model`),
+  matching the swarm path.
+- **read-only runs no longer create the workspace dir** — `os.makedirs` is skipped for
+  `sandbox="read-only"`.
+
+### Security
+
+- The claude backend's boundary is **tool-level permission modes**, not an OS sandbox — documented
+  honestly in the README and server instructions.
+- `CLAUDE_BRIDGE_INHERIT_MCP=1` (the recursion-guard bypass) is documented as a deliberate security
+  trade-off: the env var is inherited by every subprocess the server spawns.
+
 ## [0.22.1] - 2026-07-28
 
 Swept the other three CLIs after the agy work. **codex and copilot needed no code
