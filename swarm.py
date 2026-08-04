@@ -33,6 +33,18 @@ DEFAULT_MAX_CONCURRENCY = 4
 _REAL_SETTINGS = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
 
 
+def _watch_allowed(watch: bool) -> bool:
+    """Honor the process-wide viewer switch (server.WATCH_ENABLED).
+
+    server.py already gates its tools, but swarm is also a library: a direct
+    caller passing watch=True with the viewer off gets a normal headless run
+    rather than a RuntimeError out of swarm_watch.ensure_server.
+    """
+    import server
+
+    return bool(watch) and server.WATCH_ENABLED
+
+
 # ----------------------------------------------------------------------------- isolation
 def _make_isolated_home() -> Path:
     """Fresh temp HOME seeded with settings.json (to keep the same model)."""
@@ -478,6 +490,7 @@ def swarm_image(
         raise ValueError("output_paths must align with prompts")
     ws = _normalize_workspaces(len(prompts), workspaces)
     targets = [os.path.abspath(p) for p in output_paths]
+    watch = _watch_allowed(watch)
     runner = _run_image_worker_watched if watch else _run_image_worker
     if watch:
         import swarm_watch
@@ -894,6 +907,7 @@ def swarm_agents(
     prompts = [t["prompt"] for t in norm]
     workspaces = [t["workspace"] for t in norm]
     backends = [t["backend"] for t in norm]
+    watch = _watch_allowed(watch)
     if watch:
         import swarm_watch
 

@@ -196,8 +196,8 @@ path to hardcode, no `git pull` to remember:
 
 uvx pins to the version it first caches and does **not** auto-upgrade, so you never run an update you
 didn't choose — important, since the bridge runs [unsandboxed code](#security): a surprise (or
-compromised) release can't execute until you opt in. When the startup check warns that a newer
-release is out, upgrade deliberately and restart Claude Code:
+compromised) release can't execute until you opt in. This fork makes **no network calls of its own**
+— there is no startup update check and no telemetry — so upgrading is entirely on your schedule:
 
 ```bash
 uvx agent-intern@latest      # fetch + run the newest release (refreshes uv's cache)
@@ -273,6 +273,34 @@ do the same.
 
 ## Tools
 
+<a id="tool-visibility"></a>
+
+> [!IMPORTANT]
+> **Not every tool below is exposed by default.** Tools are grouped by backend, and only the
+> **enabled** groups are registered with the MCP server — a hidden group's tools never appear in
+> the client's tool list, so the model can't call them and pays no context for their schemas.
+>
+> | | |
+> |---|---|
+> | **On by default** | `codex`, `copilot`, `cursor`, `claude` |
+> | **Off by default** | `antigravity`, `swarm` — both drive `agy -p`, which runs with `--dangerously-skip-permissions` and [no usable sandbox](#security); the swarm multiplies that by N concurrent agents |
+>
+> Change it with **`AGENT_INTERN_TOOLS`** in the server's env:
+>
+> ```jsonc
+> "agent-intern": {
+>   "command": "uvx",
+>   "args": ["agent-intern"],
+>   "env": { "AGENT_INTERN_TOOLS": "all" }        // every group
+>   // "env": { "AGENT_INTERN_TOOLS": "codex,claude" }   // just these two
+>   // "env": { "AGENT_INTERN_TOOLS": "none" }           // register nothing
+> }
+> ```
+>
+> Unknown names are warned about on stderr and ignored. Any `*_status` tool reports which groups
+> are live. The **`watch?` argument** shown in the tables below likewise exists only when
+> [watch mode](#watch-mode) is enabled — by default it is stripped from every tool's schema.
+
 ### 🛰️ Antigravity
 
 | Tool | Purpose |
@@ -281,7 +309,7 @@ do the same.
 | `antigravity_continue(prompt, workspace?, model?, timeout_s?=180, watch?=false)` | Continue the conversation **rooted at `workspace`** (pinned by id). agy's model is per-invocation, so `model` can differ from the original ask. `watch=true` opens the live view. |
 | `antigravity_image(prompt, output_path?, workspace?, timeout_s?=240, watch?=false)` | Generate an image; saves the file (extension corrected to the real bytes) and returns its path + format/size. `watch=true` streams progress and **shows the image** inline. |
 | `antigravity_image_swarm(prompts, output_paths?, workspaces?, max_concurrency?=4, timeout_s?=240, watch?=false)` | Generate **several images in parallel** (one worker per prompt). |
-| `antigravity_status()` | Setup diagnostics: **the bridge's own version + whether a newer release is available**, plus agy version/compat, state dirs, and newest-transcript readability. Spends no quota. |
+| `antigravity_status()` | Setup diagnostics: **the bridge's own version + which tool groups are exposed**, plus agy version/compat, state dirs, and newest-transcript readability. Spends no quota. |
 
 ### 🤖 Codex
 
@@ -305,7 +333,7 @@ do the same.
 |---|---|
 | `cursor_ask(prompt, workspace?, sandbox?="read-only", model?, timeout_s?=180, watch?=false)` | Start a **new** Cursor chat. `sandbox` maps to cursor's mode/force flags (**agent-enforced**, not an OS sandbox — see [Cursor bridge](#cursor-bridge)); `model` selects the model (`--model`, validated against `cursor-agent models`). `watch=true` opens the live view, streaming cursor's steps from its `--output-format stream-json` event stream. |
 | `cursor_continue(prompt, workspace?, sandbox?="read-only", timeout_s?=180, watch?=false)` | Continue the Cursor chat **rooted at `workspace`** — resumes the exact chat id the bridge minted (`create-chat` + `--resume`), falling back to the newest on-disk chat for that cwd after a restart. `watch=true` opens the live view. |
-| `cursor_status()` | Setup diagnostics: **the bridge's own version + whether a newer release is available**, plus cursor version and login status (`cursor-agent status`). Spends no quota. |
+| `cursor_status()` | Setup diagnostics: **the bridge's own version + which tool groups are exposed**, plus cursor version and login status (`cursor-agent status`). Spends no quota. |
 
 ### ⚡ Claude
 
@@ -455,6 +483,13 @@ set `CURSOR_API_KEY` for headless use. Check with `cursor_status`. If `cursor-ag
 <a id="watch-mode"></a>
 
 ## 👁️ Watch mode — Agent Intern (experimental)
+
+> [!IMPORTANT]
+> **Watch mode is OFF in this fork unless you opt in with `AGENT_INTERN_WATCH=1`.** With it off,
+> `watch` is stripped from every tool's schema and description, ignored if a caller passes it
+> anyway, and **no HTTP listener is ever bound** — the localhost viewer serves prompts, answers,
+> and the commands agents ran, with no authentication and no `Origin`/`Host` check, so it only
+> runs when you ask for it. Everything below applies once it is enabled.
 
 Pass **`watch=true`** to **any single-prompt tool** — `antigravity_ask`, `antigravity_continue`,
 `antigravity_image`, `codex_ask`, `codex_continue`, `copilot_ask`, `copilot_continue`, `cursor_ask`,

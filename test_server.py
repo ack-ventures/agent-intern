@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import os
+import pathlib
 import sqlite3
 import subprocess
 import time
@@ -337,135 +338,45 @@ def test_env_truthy_false_when_unset(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# _update_warning  (nag when a newer bridge tag exists on GitHub)
+# _bridge_version_status  (local only — this server has no update check)
 # --------------------------------------------------------------------------
 
 
-def test_update_warning_warns_for_newer(monkeypatch):
-    monkeypatch.setattr(server, "__version__", "0.8.0")
-    msg = server._update_warning((0, 9, 0))
-    assert msg is not None
-    assert "0.9.0" in msg  # the newer version available
-    assert "0.8.0" in msg  # the version currently running
-    assert "git pull" in msg
-
-
-def test_update_warning_none_for_equal(monkeypatch):
-    monkeypatch.setattr(server, "__version__", "0.8.0")
-    assert server._update_warning((0, 8, 0)) is None
-
-
-def test_update_warning_none_for_older(monkeypatch):
-    monkeypatch.setattr(server, "__version__", "0.8.0")
-    assert server._update_warning((0, 7, 5)) is None
-
-
-def test_update_warning_none_when_latest_unknown():
-    assert server._update_warning(None) is None
-
-
-def test_update_warning_none_when_current_unparseable(monkeypatch):
-    monkeypatch.setattr(server, "__version__", "not-a-version")
-    assert server._update_warning((9, 9, 9)) is None
-
-
-# --------------------------------------------------------------------------
-# _fetch_latest_release_version  (GitHub tags API; never raises on the network)
-# --------------------------------------------------------------------------
-
-
-class _FakeResp:
-    """Minimal urlopen() stand-in: works as a context manager and feeds json.load."""
-
-    def __init__(self, body: str):
-        self._body = body.encode()
-
-    def read(self, *_a):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-def test_fetch_latest_release_version_picks_highest(monkeypatch):
-    body = '[{"name": "v0.5.0"}, {"name": "v0.8.0"}, {"name": "v0.7.1"}, {"name": "nightly"}]'
-    monkeypatch.setattr(server.urllib.request, "urlopen", lambda *a, **k: _FakeResp(body))
-    assert server._fetch_latest_release_version() == (0, 8, 0)
-
-
-def test_fetch_latest_release_version_none_on_network_error(monkeypatch):
-    def _raise(*_a, **_k):
-        raise server.urllib.error.URLError("offline")
-
-    monkeypatch.setattr(server.urllib.request, "urlopen", _raise)
-    assert server._fetch_latest_release_version() is None
-
-
-def test_fetch_latest_release_version_none_on_non_list(monkeypatch):
-    # rate-limit / error bodies come back as a JSON object, not a list of tags
-    monkeypatch.setattr(
-        server.urllib.request, "urlopen", lambda *a, **k: _FakeResp('{"message": "rate limited"}')
-    )
-    assert server._fetch_latest_release_version() is None
-
-
-def test_fetch_latest_release_version_none_when_no_semver_tags(monkeypatch):
-    monkeypatch.setattr(
-        server.urllib.request, "urlopen", lambda *a, **k: _FakeResp('[{"name": "latest"}]')
-    )
-    assert server._fetch_latest_release_version() is None
-
-
-# --------------------------------------------------------------------------
-# _bridge_version_status  (surfaces the update notice in antigravity_status)
-# --------------------------------------------------------------------------
-
-
-def test_bridge_version_status_flags_newer_release(monkeypatch):
-    monkeypatch.delenv("AGY_BRIDGE_NO_UPDATE_CHECK", raising=False)
+def test_bridge_version_status_is_local_and_ok(monkeypatch):
     monkeypatch.setattr(server, "__version__", "0.10.1")
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (0, 10, 2))
     label, ok, detail = server._bridge_version_status()
     assert label == "bridge version"
-    assert ok is True  # an available update is informational, not a fault
-    assert "0.10.2" in detail and "available" in detail
-    assert "uvx agent-intern@latest" in detail
+    assert ok is True  # informational: must never flip status to PROBLEMS FOUND
+    assert "0.10.1" in detail
 
 
-def test_bridge_version_status_reports_latest(monkeypatch):
-    monkeypatch.delenv("AGY_BRIDGE_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr(server, "__version__", "0.10.1")
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (0, 10, 1))
-    _, ok, detail = server._bridge_version_status()
-    assert ok is True
-    assert "latest" in detail and "available" not in detail
+def test_bridge_version_status_names_the_enabled_tool_groups(monkeypatch):
+    monkeypatch.setattr(server, "ENABLED_TOOL_GROUPS", frozenset({"codex", "claude"}))
+    monkeypatch.setattr(server, "HIDDEN_TOOLS", [])
+    _, _, detail = server._bridge_version_status()
+    assert "claude, codex" in detail
 
 
-def test_bridge_version_status_unavailable_when_offline(monkeypatch):
-    monkeypatch.delenv("AGY_BRIDGE_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: None)
-    _, ok, detail = server._bridge_version_status()
-    assert ok is True
-    assert "unavailable" in detail
+def test_bridge_version_status_points_at_the_env_var_when_tools_are_hidden(monkeypatch):
+    monkeypatch.setattr(server, "HIDDEN_TOOLS", ["antigravity_ask", "agent_swarm"])
+    _, _, detail = server._bridge_version_status()
+    assert "hidden: 2 tools" in detail
+    assert server.TOOLS_ENV in detail
 
 
-def test_bridge_version_status_respects_opt_out(monkeypatch):
-    monkeypatch.setenv("AGY_BRIDGE_NO_UPDATE_CHECK", "1")
+def test_no_module_reaches_the_network():
+    """The bridge must not ship an update check (or any other outbound call).
 
-    def _boom():
-        raise AssertionError("update check must not run when disabled")
-
-    monkeypatch.setattr(server, "_fetch_latest_release_version", _boom)
-    _, ok, detail = server._bridge_version_status()
-    assert ok is True
-    assert "disabled" in detail
+    urllib.request was imported solely for the GitHub tags poll; if it comes back,
+    something is talking to the network again at import or startup.
+    """
+    src = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+    assert "urllib.request" not in src
+    assert "api.github.com" not in src
+    assert not hasattr(server, "_fetch_latest_release_version")
 
 
 def test_collect_status_first_row_is_bridge_version(monkeypatch):
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: None)
     monkeypatch.setattr(server, "_get_agy_version", lambda: None)  # skip the agy subprocess
     rows = server._collect_status()
     assert rows[0][0] == "bridge version"
@@ -697,52 +608,70 @@ def test_documented_model_slugs_still_accepted_by_live_agy(monkeypatch):
 # --------------------------------------------------------------------------
 
 
+def _agy_groups(monkeypatch):
+    """Enable a group that drives agy, so the compat check actually runs."""
+    monkeypatch.setattr(server, "ENABLED_TOOL_GROUPS", frozenset({"antigravity"}))
+
+
 def test_startup_checks_warns_on_newer_agy(monkeypatch, caplog):
+    _agy_groups(monkeypatch)
     monkeypatch.setattr(server, "_get_agy_version", lambda: "2.0.0")
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: None)
     caplog.set_level("WARNING", logger="agy_bridge")
     server._startup_checks()
     assert "newer" in caplog.text
 
 
 def test_startup_checks_silent_on_verified_agy(monkeypatch, caplog):
+    _agy_groups(monkeypatch)
     monkeypatch.setattr(server, "_get_agy_version", lambda: "1.0.10")
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: None)
     caplog.set_level("WARNING", logger="agy_bridge")
     server._startup_checks()
     assert caplog.text == ""
 
 
 def test_startup_checks_silent_when_agy_unavailable(monkeypatch, caplog):
+    _agy_groups(monkeypatch)
     monkeypatch.setattr(server, "_get_agy_version", lambda: None)
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: None)
     caplog.set_level("WARNING", logger="agy_bridge")
     server._startup_checks()
     assert caplog.text == ""
 
 
-def test_startup_checks_warns_on_newer_bridge_release(monkeypatch, caplog):
-    # agy is fine; a newer bridge tag exists on GitHub -> update nag fires.
-    monkeypatch.setattr(server, "_get_agy_version", lambda: "1.0.10")
-    monkeypatch.setattr(server, "__version__", "0.8.0")
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (0, 9, 0))
-    caplog.set_level("WARNING", logger="agy_bridge")
-    server._startup_checks()
-    assert "0.9.0" in caplog.text
-    assert "git pull" in caplog.text
-
-
-def test_startup_checks_skips_update_check_when_disabled(monkeypatch, caplog):
-    monkeypatch.setattr(server, "_get_agy_version", lambda: "1.0.10")
-    monkeypatch.setenv("AGY_BRIDGE_NO_UPDATE_CHECK", "1")
+def test_startup_checks_skip_the_agy_probe_when_no_agy_group_is_enabled(monkeypatch, caplog):
+    # The default config exposes no agy-backed tools, so spawning `agy --version`
+    # at every startup would be pure cost — and a warning about a CLI the client
+    # can't reach is noise.
+    monkeypatch.setattr(server, "ENABLED_TOOL_GROUPS", frozenset({"codex", "claude"}))
 
     def _boom():
-        raise AssertionError("update check must not run when disabled")
+        raise AssertionError("must not probe agy when no agy-backed group is enabled")
 
-    monkeypatch.setattr(server, "_fetch_latest_release_version", _boom)
+    monkeypatch.setattr(server, "_get_agy_version", _boom)
     caplog.set_level("WARNING", logger="agy_bridge")
     server._startup_checks()
     assert caplog.text == ""
+
+
+def test_startup_checks_warn_about_an_unknown_tool_group(monkeypatch, caplog):
+    monkeypatch.setenv(server.TOOLS_ENV, "codex,clyde")
+    monkeypatch.setattr(server, "ENABLED_TOOL_GROUPS", frozenset({"codex"}))
+    caplog.set_level("WARNING", logger="agy_bridge")
+    server._startup_checks()
+    assert "clyde" in caplog.text
+
+
+def test_startup_checks_make_no_network_call(monkeypatch):
+    # There is no update check any more: startup must be entirely local.
+    _agy_groups(monkeypatch)
+    monkeypatch.setattr(server, "_get_agy_version", lambda: "1.0.10")
+    import socket
+
+    def _no_sockets(*_a, **_k):
+        raise AssertionError("startup must not open a socket")
+
+    monkeypatch.setattr(socket, "create_connection", _no_sockets)
+    monkeypatch.setattr(socket.socket, "connect", _no_sockets)
+    server._startup_checks()
 
 
 # --------------------------------------------------------------------------
@@ -1965,10 +1894,9 @@ def test_antigravity_status_formats_report(status_dirs, monkeypatch):
 
 
 def test_codex_status_includes_bridge_version_row(monkeypatch):
-    # The bridge's update notice must surface on a Codex-only install too, not
-    # just via antigravity_status. Stub the backend rows so the test doesn't need
-    # codex installed, and pin a newer release so the notice shows.
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (99, 0, 0))
+    # The bridge version row must surface on a Codex-only install too, not just
+    # via antigravity_status (which the default config doesn't even expose). Stub
+    # the backend rows so the test doesn't need codex installed.
     monkeypatch.setattr(
         server.codex_bridge, "status_rows", lambda: [("codex CLI", True, "v0.141.0")]
     )
@@ -1976,12 +1904,10 @@ def test_codex_status_includes_bridge_version_row(monkeypatch):
     assert out.startswith("codex bridge status")
     assert "bridge version" in out
     assert f"v{server.__version__}" in out
-    assert "v99.0.0 available" in out
 
 
 def test_copilot_status_includes_bridge_version_row(monkeypatch):
     # Same guarantee for a Copilot-only install.
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (99, 0, 0))
     monkeypatch.setattr(
         server.copilot_bridge, "status_rows", lambda: [("copilot CLI", True, "v1.0.68")]
     )
@@ -1989,12 +1915,10 @@ def test_copilot_status_includes_bridge_version_row(monkeypatch):
     assert out.startswith("copilot bridge status")
     assert "bridge version" in out
     assert f"v{server.__version__}" in out
-    assert "v99.0.0 available" in out
 
 
 def test_cursor_status_includes_bridge_version_row(monkeypatch):
     # Same guarantee for a Cursor-only install.
-    monkeypatch.setattr(server, "_fetch_latest_release_version", lambda: (99, 0, 0))
     monkeypatch.setattr(
         server.cursor_bridge, "status_rows", lambda: [("cursor CLI", True, "2026.07.08")]
     )
@@ -2002,7 +1926,6 @@ def test_cursor_status_includes_bridge_version_row(monkeypatch):
     assert out.startswith("cursor bridge status")
     assert "bridge version" in out
     assert f"v{server.__version__}" in out
-    assert "v99.0.0 available" in out
 
 
 # --------------------------------------------------------------------------
@@ -2382,17 +2305,206 @@ def test_server_wires_instructions_into_the_mcp_object():
     assert instr == server.SERVER_INSTRUCTIONS
 
 
-def test_server_instructions_cover_all_backends():
+def test_server_instructions_cover_every_enabled_backend():
     instr = server.mcp.instructions.lower()
-    for backend in ("antigravity", "codex", "copilot", "cursor"):
-        assert backend in instr, f"instructions never mention the {backend} backend"
+    for group in server.ENABLED_TOOL_GROUPS - {"swarm"}:
+        assert group in instr, f"instructions never mention the enabled {group} backend"
+
+
+def test_server_instructions_never_advertise_a_hidden_backend():
+    # Instructions that route work to a tool the client can't see are worse than
+    # none: the model picks it, the call fails, and the turn is spent recovering.
+    instr = server.mcp.instructions.lower()
+    for group in set(server.TOOL_GROUPS) - server.ENABLED_TOOL_GROUPS:
+        assert group not in instr, f"instructions advertise the hidden {group} group"
 
 
 def test_server_instructions_route_key_capabilities():
-    # The high-value cues that justify an always-on, every-session block: image
-    # generation, parallel fan-out, the workspace footgun, and the safety
-    # boundary. Dropping any of these silently degrades how well client models
-    # use the bridge, so guard them.
+    # The high-value cues that justify an always-on, every-session block: the
+    # workspace footgun and the safety boundary. Dropping either silently degrades
+    # how well client models use the bridge, so guard them.
     instr = server.mcp.instructions.lower()
-    for cue in ("antigravity_image", "agent_swarm", "workspace", "sandbox"):
+    for cue in ("workspace", "sandbox"):
         assert cue in instr, f"instructions omit the {cue!r} routing cue"
+
+
+def test_server_instructions_include_the_agy_cues_when_those_groups_are_on():
+    instr = server.build_instructions(frozenset(server.TOOL_GROUPS), watch=False).lower()
+    for cue in ("antigravity_image", "agent_swarm", "antigravity_image_swarm"):
+        assert cue in instr, f"instructions omit the {cue!r} routing cue"
+
+
+def test_server_instructions_mention_watch_only_when_it_is_enabled():
+    groups = frozenset({"codex"})
+    assert "watch=true" not in server.build_instructions(groups, watch=False)
+    assert "watch=true" in server.build_instructions(groups, watch=True)
+
+
+def test_server_instructions_survive_every_group_being_disabled():
+    instr = server.build_instructions(frozenset(), watch=False)
+    assert instr.strip()  # an empty instructions block would be a protocol wart
+    assert server.TOOLS_ENV in instr
+
+
+# --------------------------------------------------------------------------
+# Tool visibility  (which tools this server registers with FastMCP at all)
+# --------------------------------------------------------------------------
+
+
+def _advertised() -> set:
+    """The tool names a connected client would actually see."""
+    return {t.name for t in asyncio.run(server.mcp._list_tools())}
+
+
+def test_default_config_hides_the_antigravity_and_swarm_tools():
+    # Both drive `agy -p`, which runs with --dangerously-skip-permissions and no
+    # usable sandbox, so they are opt-in rather than opt-out.
+    advertised = _advertised()
+    assert not [n for n in advertised if n.startswith("antigravity")]
+    assert "agent_swarm" not in advertised
+    assert {"codex_ask", "copilot_ask", "cursor_ask", "claude_ask"} <= advertised
+
+
+def test_hidden_tools_are_still_plain_importable_functions():
+    # Hiding is a registration decision, not a deletion: internal callers and
+    # these tests keep working, the protocol just never mentions them.
+    assert callable(server.antigravity_ask)
+    assert "antigravity_ask" in server.HIDDEN_TOOLS
+    assert "codex_ask" in server.REGISTERED_TOOLS
+
+
+def test_registered_and_hidden_together_account_for_every_tool():
+    overlap = set(server.REGISTERED_TOOLS) & set(server.HIDDEN_TOOLS)
+    assert not overlap
+    assert len(server.REGISTERED_TOOLS) + len(server.HIDDEN_TOOLS) == 18
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, server.DEFAULT_TOOL_GROUPS),
+        ("", server.DEFAULT_TOOL_GROUPS),
+        ("   ", server.DEFAULT_TOOL_GROUPS),
+        ("all", frozenset(server.TOOL_GROUPS)),
+        ("ALL", frozenset(server.TOOL_GROUPS)),
+        ("none", frozenset()),
+        ("codex", frozenset({"codex"})),
+        ("codex,claude", frozenset({"codex", "claude"})),
+        ("codex, CLAUDE ", frozenset({"codex", "claude"})),
+        ("codex claude", frozenset({"codex", "claude"})),
+        ("codex,nonsense", frozenset({"codex"})),
+        # An all-garbage list falls back to the default rather than registering
+        # nothing: a typo must not leave the client with a server that can't act.
+        ("nonsense", server.DEFAULT_TOOL_GROUPS),
+    ],
+)
+def test_parse_tool_groups(raw, expected):
+    assert server.parse_tool_groups(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, []),
+        ("codex,claude", []),
+        ("all", []),
+        ("codex,clyde,swrm", ["clyde", "swrm"]),
+        ("clyde,clyde", ["clyde"]),
+    ],
+)
+def test_unknown_tool_groups(raw, expected):
+    assert server._unknown_tool_groups(raw) == expected
+
+
+def test_tool_decorator_rejects_an_unknown_group():
+    with pytest.raises(ValueError, match="unknown tool group"):
+        server._tool("nope")
+
+
+# --------------------------------------------------------------------------
+# Watch viewer  (off by default: no schema arg, no dispatch, no listening socket)
+# --------------------------------------------------------------------------
+
+
+def test_watch_is_off_by_default():
+    assert server.WATCH_ENABLED is False
+
+
+def test_watch_argument_is_absent_from_every_advertised_schema():
+    for tool in asyncio.run(server.mcp._list_tools()):
+        assert "watch" not in tool.parameters["properties"], f"{tool.name} still offers watch"
+
+
+def test_watch_is_absent_from_the_advertised_descriptions():
+    # The docstring IS the tool description, so a stale "watch:" Args entry would
+    # advertise an argument the schema no longer accepts.
+    for tool in asyncio.run(server.mcp._list_tools()):
+        assert "watch:" not in (tool.description or ""), f"{tool.name} still documents watch"
+
+
+def test_watch_requested_is_false_when_disabled(monkeypatch):
+    monkeypatch.setattr(server, "WATCH_ENABLED", False)
+    assert server._watch_requested(True) is False
+    assert server._watch_requested(False) is False
+
+
+def test_watch_requested_honors_an_explicit_opt_in(monkeypatch):
+    monkeypatch.setattr(server, "WATCH_ENABLED", True)
+    assert server._watch_requested(True) is True
+    assert server._watch_requested(False) is False
+
+
+def test_watch_server_refuses_to_bind_when_disabled(monkeypatch):
+    monkeypatch.setattr(server, "WATCH_ENABLED", False)
+    monkeypatch.setattr(server, "_WATCH_SERVER", None)
+    with pytest.raises(RuntimeError, match="disabled"):
+        server._ensure_watch_server()
+
+
+def test_swarm_watch_server_refuses_to_bind_when_disabled(monkeypatch):
+    import swarm_watch
+
+    monkeypatch.setattr(server, "WATCH_ENABLED", False)
+    monkeypatch.setattr(swarm_watch, "_SERVER", None)
+    with pytest.raises(RuntimeError, match="disabled"):
+        swarm_watch.ensure_server()
+
+
+def test_a_watched_tool_call_runs_headless_instead(monkeypatch, tmp_path):
+    # watch=True from an internal caller must fall through to the normal path,
+    # not open a viewer — the argument is inert, not an error.
+    monkeypatch.setattr(server, "WATCH_ENABLED", False)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("watched runner must not be reached with the viewer off")
+
+    monkeypatch.setattr(server, "_run_codex_watched", _boom)
+    monkeypatch.setattr(server, "_run_with_progress", lambda *a, **k: _immediate("headless answer"))
+    out = asyncio.run(server.codex_ask("hi", workspace=str(tmp_path), watch=True))
+    assert out == "headless answer"
+
+
+async def _immediate(value):
+    return value
+
+
+def test_strip_watch_doc_removes_the_entry_and_its_continuations():
+    doc = (
+        "Do a thing.\n\n"
+        "    Args:\n"
+        "        prompt: what to do.\n"
+        "        watch: If true, open a live view that streams\n"
+        "               the steps as they happen.\n"
+        "        timeout_s: seconds.\n"
+        "    "
+    )
+    out = server.strip_watch_doc(doc)
+    assert "watch" not in out
+    assert "prompt: what to do." in out
+    assert "timeout_s: seconds." in out
+
+
+def test_strip_watch_doc_leaves_prose_alone():
+    doc = "Runs headless; nothing to watch here.\n"
+    assert server.strip_watch_doc(doc) == doc
+    assert server.strip_watch_doc(None) is None

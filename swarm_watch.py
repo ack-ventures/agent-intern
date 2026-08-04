@@ -107,7 +107,18 @@ def _allowed_images() -> set:
 
 # ------------------------------------------------------------------- HTTP server
 def ensure_server() -> int:
+    """Start the dashboard's localhost server once; return its port.
+
+    Refuses unless the viewer is enabled (server.WATCH_ENABLED / AGENT_INTERN_WATCH)
+    — with it off, nothing in this process may bind a listening socket. swarm.py
+    only reaches here when a caller asked for watch AND the gate allowed it, so
+    this mirrors server._ensure_watch_server as a last line of defence.
+    """
     global _SERVER
+    import server  # late: this module is imported lazily by swarm.py
+
+    if not server.WATCH_ENABLED:
+        raise RuntimeError(f"watch viewer is disabled; set {server.WATCH_ENV}=1 to enable it")
     if _SERVER is not None:
         return _SERVER[1]
 

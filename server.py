@@ -17,6 +17,21 @@ host's controlling terminal when spawning it (see _spawn_kwargs), which prevents
 the pre-1.0.15 terminal leak into the host TUI and is harmless on 1.0.15+.
 State-file layout and transcript schema re-verified on agy 1.0.15.
 
+WHAT THIS SERVER EXPOSES (see the tool-visibility block below). Tools are grouped
+by backend and only the ENABLED groups are registered with FastMCP — a hidden
+group's tools don't appear in the client's tool list at all. The default is
+codex, copilot, cursor, claude; antigravity and swarm are OFF because both drive
+`agy -p`, which runs with --dangerously-skip-permissions and no usable sandbox
+(see the SECURITY note below). Override with AGENT_INTERN_TOOLS=all, or a list
+like AGENT_INTERN_TOOLS=codex,claude.
+
+The live "watch" viewer (a localhost HTTP server plus a browser window streaming
+a sub-agent's steps) is OFF unless AGENT_INTERN_WATCH is truthy. With it off the
+`watch` argument is absent from every advertised tool schema, ignored if passed
+anyway, and no HTTP listener is ever bound. This server makes NO network calls of
+its own — there is no update check, no telemetry; the only egress is whatever the
+backend CLIs do with your prompts.
+
 Auth: piggybacks on whatever credential store `agy` itself uses on the host
 OS (Windows Credential Manager, macOS Keychain, libsecret on Linux). User
 must have logged in interactively at least once via the Antigravity IDE or
@@ -316,6 +331,8 @@ whole bridge inside a container or VM.
 """
 
 import asyncio
+import functools
+import inspect
 import json
 import logging
 import os
@@ -326,8 +343,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -341,6 +356,176 @@ import codex_bridge
 import copilot_bridge
 import cursor_bridge
 
+
+def _env_truthy(name: str) -> bool:
+    """True if env var `name` is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# --------------------------------------------------------------- tool visibility
+#
+# Every MCP tool belongs to a GROUP, and a group that is not enabled is never
+# registered with FastMCP at all: the client's model never sees the tool, cannot
+# call it, and pays no context tokens for its schema. This is the supported way
+# to slim the bridge down to the backends you actually use — the tool functions
+# stay importable and unit-testable either way, they are just not advertised.
+#
+# Override the default set with AGENT_INTERN_TOOLS: a comma-separated list of
+# group names, or "all" for every group.
+#   AGENT_INTERN_TOOLS=all               # everything, including antigravity+swarm
+#   AGENT_INTERN_TOOLS=codex,claude      # just those two backends
+# Unknown names are warned about and ignored rather than raising: a typo in a
+# client's env block must not take the whole server down at startup.
+TOOL_GROUPS = ("antigravity", "swarm", "codex", "copilot", "cursor", "claude")
+
+# antigravity and swarm are OFF by default. Both drive `agy -p`, which runs with
+# --dangerously-skip-permissions and no usable sandbox (see the SECURITY note in
+# the module docstring), and the swarm multiplies that by N concurrent agents.
+# Opt in explicitly via AGENT_INTERN_TOOLS if you want them.
+DEFAULT_TOOL_GROUPS = frozenset({"codex", "copilot", "cursor", "claude"})
+
+TOOLS_ENV = "AGENT_INTERN_TOOLS"
+
+
+def parse_tool_groups(raw: Optional[str]) -> frozenset[str]:
+    """Resolve the AGENT_INTERN_TOOLS value to the set of enabled groups.
+
+    Unset/blank -> DEFAULT_TOOL_GROUPS. "all" -> every group. Otherwise a
+    comma/space separated list, case-insensitive; unknown names are dropped
+    (the caller logs them). An explicit list that names nothing valid falls back
+    to the default rather than registering zero tools, which would leave the
+    client with a server that can do nothing at all.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_TOOL_GROUPS
+    names = {n.strip().lower() for n in raw.replace(",", " ").split() if n.strip()}
+    if "all" in names:
+        return frozenset(TOOL_GROUPS)
+    if "none" in names:
+        return frozenset()
+    known = frozenset(n for n in names if n in TOOL_GROUPS)
+    return known or DEFAULT_TOOL_GROUPS
+
+
+def _unknown_tool_groups(raw: Optional[str]) -> list[str]:
+    """Group names in `raw` that this server doesn't know about (for a warning)."""
+    if raw is None or not raw.strip():
+        return []
+    names = [n.strip().lower() for n in raw.replace(",", " ").split() if n.strip()]
+    return sorted({n for n in names if n not in TOOL_GROUPS and n not in {"all", "none"}})
+
+
+ENABLED_TOOL_GROUPS = parse_tool_groups(os.environ.get(TOOLS_ENV))
+
+# The live "watch" viewer — a localhost HTTP server plus a browser window that
+# streams a sub-agent's steps — is OFF unless AGENT_INTERN_WATCH is truthy. When
+# off, the `watch` argument is stripped from every tool's schema, the argument is
+# ignored if passed anyway, and no HTTP listener is ever bound. The machinery
+# stays in the module so turning the env var back on restores it whole.
+WATCH_ENV = "AGENT_INTERN_WATCH"
+WATCH_ENABLED = _env_truthy(WATCH_ENV)
+
+# Populated by @_tool at import: the tools actually advertised, and the ones a
+# disabled group suppressed. Read by *_status and the unit tests.
+REGISTERED_TOOLS: list[str] = []
+HIDDEN_TOOLS: list[str] = []
+
+
+def strip_watch_doc(doc: Optional[str]) -> Optional[str]:
+    """Drop the `watch:` entry (and its continuation lines) from an Args docstring.
+
+    FastMCP sends the docstring to the client as the tool description, so leaving
+    the paragraph in while exclude_args hides the parameter would advertise an
+    argument no caller can pass. Anything that isn't a `watch:` Args entry — prose
+    mentioning the word, other parameters — is left alone.
+    """
+    if not doc or "watch:" not in doc:
+        return doc
+    lines = doc.split("\n")
+    out: list[str] = []
+    skip_indent: Optional[int] = None
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if skip_indent is not None:
+            # Continuation lines are indented deeper than the entry itself.
+            if not stripped or indent <= skip_indent:
+                skip_indent = None
+            else:
+                continue
+        if stripped.startswith("watch:") and indent > 0:
+            skip_indent = indent
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _hide_watch_arg(fn):
+    """A registration-only proxy for `fn` with its `watch` parameter removed.
+
+    FastMCP derives a tool's schema from the signature, so handing it a proxy
+    whose signature (and docstring, and annotations) never mention `watch` is what
+    keeps a disabled feature out of the client's tool list entirely. The proxy is
+    ONLY what gets registered — the module keeps the real function, so internal
+    callers and tests are unaffected.
+
+    __signature__ is set explicitly because functools.wraps records __wrapped__,
+    which inspect.signature would otherwise follow straight back to the original.
+    """
+    sig = inspect.signature(fn)
+    trimmed = sig.replace(parameters=[p for n, p in sig.parameters.items() if n != "watch"])
+
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def proxy(*args, **kwargs):
+            kwargs.pop("watch", None)
+            return await fn(*args, **kwargs)
+
+    else:
+
+        @functools.wraps(fn)
+        def proxy(*args, **kwargs):
+            kwargs.pop("watch", None)
+            return fn(*args, **kwargs)
+
+    proxy.__signature__ = trimmed
+    proxy.__doc__ = strip_watch_doc(fn.__doc__)
+    proxy.__annotations__ = {k: v for k, v in getattr(fn, "__annotations__", {}).items()}
+    proxy.__annotations__.pop("watch", None)
+    return proxy
+
+
+def _tool(group: str, **kwargs):
+    """Register an MCP tool, but only if its `group` is enabled.
+
+    A disabled group's function is returned untouched (never handed to FastMCP),
+    so it stays a plain importable function for tests and internal callers while
+    being invisible over the protocol.
+
+    With the watch viewer off, a `watch` parameter is stripped from what gets
+    registered (see _hide_watch_arg), so no client can pass it and no model spends
+    context reading about a disabled feature. The decorator always returns the
+    ORIGINAL function, registered or not, so `server.codex_ask` is the same
+    callable it has always been.
+    """
+    if group not in TOOL_GROUPS:  # pragma: no cover - guards a typo at edit time
+        raise ValueError(f"unknown tool group {group!r}; expected one of {TOOL_GROUPS}")
+
+    def decorate(fn):
+        if group not in ENABLED_TOOL_GROUPS:
+            HIDDEN_TOOLS.append(fn.__name__)
+            return fn
+        registered = fn
+        if not WATCH_ENABLED and "watch" in inspect.signature(fn).parameters:
+            registered = _hide_watch_arg(fn)
+        mcp.tool(**kwargs)(registered)
+        REGISTERED_TOOLS.append(fn.__name__)
+        return fn
+
+    return decorate
+
+
 # Server-level instructions. The MCP client sends these to its model on connect
 # (Claude Code surfaces them as an "MCP Server Instructions" block), so EVERY
 # user who installs the bridge gets their host model taught how and WHEN to reach
@@ -349,65 +534,145 @@ import cursor_bridge
 # detail already lives in each tool's own description/annotations. The highest-
 # value content here is what a model can't infer from tool schemas alone —
 # proactive triggers, which backend to pick, and the workspace footgun.
-SERVER_INSTRUCTIONS = """\
-This server bridges five external coding CLIs — Antigravity (Gemini), OpenAI \
-Codex, GitHub Copilot, Cursor, and Claude Code — into your session as sub-agents \
-that run on the USER'S OWN quota. Delegating here spends their Gemini/Codex/\
-Copilot/Cursor/Anthropic quota instead of your tokens, gets a second model-family \
-opinion, or generates images.
+#
+# Built from the ENABLED groups, not hardcoded: instructions that advertise a
+# tool the client can't see are worse than no instructions — the model routes
+# work to a tool that isn't there, then has to recover.
+_BACKEND_NAMES = {
+    "antigravity": "Antigravity (Gemini)",
+    "codex": "OpenAI Codex",
+    "copilot": "GitHub Copilot",
+    "cursor": "Cursor",
+    "claude": "Claude Code",
+}
 
-Reach for these tools when:
-- the user wants an IMAGE — antigravity_image is your only image generator \
-(antigravity_image_swarm for several at once).
-- a job splits into many independent sub-tasks — agent_swarm runs them in \
-parallel, mixing any backends in one call.
-- you want a heavier or different-family model's take, or want to offload grunt \
-work off your own token budget.
-Don't delegate what you can just answer: each call takes ~10-30s and spends the \
-user's quota.
+_BACKEND_QUOTA = {
+    "antigravity": "Gemini",
+    "codex": "Codex",
+    "copilot": "Copilot",
+    "cursor": "Cursor",
+    "claude": "Anthropic",
+}
 
-Pick a backend:
-- antigravity_* (Gemini) — fast, cheap tool-calling; the ONLY image model. No \
-real sandbox, so trusted prompts only.
-- codex_* (OpenAI) — strongest reasoning and real repo edits behind a REAL \
-enforced sandbox (workspace-write by default: edits under the workspace, \
-nothing outside it; pass sandbox="read-only" for a look-but-don't-touch \
-answer).
-- copilot_* (GitHub) — agentic coding on a Copilot plan; sandbox is best-effort, \
-not an OS boundary.
-- cursor_* (Cursor) — agentic coding on a Cursor plan, with a wide model menu \
-(GPT/Claude/Grok/Composer via `model`); sandbox is agent-enforced (read-only = \
-ask mode), not an OS boundary.
-- claude_* (Claude Code) — the Claude Code CLI itself, headless. Automode by \
-default (sandbox="default"); `model` picks the backend: an Anthropic model \
-spends the SAME Anthropic quota as this session, while a claude-os harness id \
-("ds-flash", "k3", or one from ~/.config/claude-os/models.txt) runs on that \
-provider's quota (DeepSeek/Kimi/etc.). Permission boundary is tool-level, not an \
-OS sandbox.
+_BACKEND_BLURBS = {
+    "antigravity": "- antigravity_* (Gemini) — fast, cheap tool-calling; the ONLY image model. No "
+    "real sandbox, so trusted prompts only.",
+    "codex": "- codex_* (OpenAI) — strongest reasoning and real repo edits behind a REAL "
+    "enforced sandbox (workspace-write by default: edits under the workspace, nothing "
+    'outside it; pass sandbox="read-only" for a look-but-don\'t-touch answer).',
+    "copilot": "- copilot_* (GitHub) — agentic coding on a Copilot plan; sandbox is "
+    "best-effort, not an OS boundary.",
+    "cursor": "- cursor_* (Cursor) — agentic coding on a Cursor plan, with a wide model menu "
+    "(GPT/Claude/Grok/Composer via `model`); sandbox is agent-enforced (read-only = ask "
+    "mode), not an OS boundary.",
+    "claude": "- claude_* (Claude Code) — the Claude Code CLI itself, headless. Automode by "
+    'default (sandbox="default"); `model` picks the backend: an Anthropic model spends the '
+    'SAME Anthropic quota as this session, while a claude-os harness id ("ds-flash", '
+    '"k3", or one from ~/.config/claude-os/models.txt) runs on that provider\'s quota '
+    "(DeepSeek/Kimi/etc.). Permission boundary is tool-level, not an OS sandbox.",
+}
 
-Mechanics:
-- Pass `workspace` = the relevant project directory. It defaults to the server's \
-cwd, so WITHOUT it the sub-agent answers with no repo context — this is the most \
-common mistake.
-- claude_* prompts must be EXPLICIT and SELF-CONTAINED — what to do, which files \
-to touch, constraints, the expected output. The sub-agent has no shared context \
-with you.
-- *_continue resumes the thread rooted at a workspace; swarm workers are \
-one-shot (no continue).
-- watch=true opens a live browser view of the agent working (identical return \
-value).
-- *_status checks a backend is installed and logged in, and spends no quota — \
-use it if a call reports "not found".
 
-Security: all five run as autonomous agents and only Codex's sandbox is a hard \
-OS boundary. Use only with trusted prompts on trusted content."""
+def _oxford(items: list[str]) -> str:
+    """Join names for prose: "a", "a and b", "a, b, and c"."""
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def build_instructions(
+    groups: Optional[frozenset[str]] = None, watch: Optional[bool] = None
+) -> str:
+    """The server instructions for a given set of enabled groups.
+
+    Defaults to this process's live configuration; the arguments exist so the
+    tests can check every combination without re-importing the module.
+    """
+    groups = ENABLED_TOOL_GROUPS if groups is None else groups
+    watch = WATCH_ENABLED if watch is None else watch
+    backends = [g for g in ("antigravity", "codex", "copilot", "cursor", "claude") if g in groups]
+    if not backends:
+        return (
+            "This server exposes no backend tools right now (AGENT_INTERN_TOOLS "
+            "disabled them). Nothing here can be called."
+        )
+
+    names = _oxford([_BACKEND_NAMES[g] for g in backends])
+    count = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}[len(backends)]
+    quotas = "/".join(_BACKEND_QUOTA[g] for g in backends)
+    parts = [
+        f"This server bridges {count} external coding "
+        f"{'CLI' if len(backends) == 1 else 'CLIs'} — {names} — into your session as "
+        "sub-agents that run on the USER'S OWN quota. Delegating here spends their "
+        f"{quotas} quota instead of your tokens, or gets a second model-family opinion.",
+        "",
+        "Reach for these tools when:",
+    ]
+    if "antigravity" in groups:
+        parts.append(
+            "- the user wants an IMAGE — antigravity_image is your only image generator"
+            + (" (antigravity_image_swarm for several at once)." if "swarm" in groups else ".")
+        )
+    if "swarm" in groups:
+        parts.append(
+            "- a job splits into many independent sub-tasks — agent_swarm runs them in "
+            "parallel, mixing any backends in one call."
+        )
+    parts += [
+        "- you want a heavier or different-family model's take, or want to offload grunt "
+        "work off your own token budget.",
+        "Don't delegate what you can just answer: each call takes ~10-30s and spends the "
+        "user's quota.",
+        "",
+        "Pick a backend:" if len(backends) > 1 else "The backend:",
+    ]
+    parts += [_BACKEND_BLURBS[g] for g in backends]
+    parts += [
+        "",
+        "Mechanics:",
+        "- Pass `workspace` = the relevant project directory. It defaults to the server's "
+        "cwd, so WITHOUT it the sub-agent answers with no repo context — this is the most "
+        "common mistake.",
+    ]
+    if "claude" in groups:
+        parts.append(
+            "- claude_* prompts must be EXPLICIT and SELF-CONTAINED — what to do, which "
+            "files to touch, constraints, the expected output. The sub-agent has no shared "
+            "context with you."
+        )
+    parts.append(
+        "- *_continue resumes the thread rooted at a workspace"
+        + ("; swarm workers are one-shot (no continue)." if "swarm" in groups else ".")
+    )
+    if watch:
+        parts.append(
+            "- watch=true opens a live browser view of the agent working (identical return value)."
+        )
+    parts += [
+        "- *_status checks a backend is installed and logged in, and spends no quota — use "
+        'it if a call reports "not found".',
+        "",
+        f"Security: {'all' if len(backends) > 1 else 'these'} run as autonomous agents and "
+        + (
+            "only Codex's sandbox is a hard OS boundary."
+            if "codex" in groups
+            else "none of their sandboxes is a hard OS boundary."
+        )
+        + " Use only with trusted prompts on trusted content.",
+    ]
+    return "\n".join(parts)
+
+
+SERVER_INSTRUCTIONS = build_instructions()
 
 mcp = FastMCP("agent-intern", instructions=SERVER_INSTRUCTIONS)
 
 # The running bridge's version — the source of truth is THIS file (not the
 # installed package metadata, which goes stale on editable installs). Keep in
-# sync with pyproject.toml's version. Compared at startup against the latest
-# tag on GitHub so a long-lived clone learns when to `git pull`.
+# sync with pyproject.toml's version. Reported by *_status; nothing compares it
+# against a remote (this server makes no network calls of its own).
 __version__ = "0.23.0"
 
 # Logs go to stderr (stdout is the MCP protocol channel). Quiet by default;
@@ -420,10 +685,6 @@ log = logging.getLogger("agy_bridge")
 #   AGY_BIN=%LOCALAPPDATA%\agy\bin\agy.exe
 # Read once at import; the launching process's environment wins.
 AGY_BIN = os.environ.get("AGY_BIN", "agy")
-
-# GitHub repo polled at startup for a newer release tag. Override AGY_BRIDGE_REPO
-# if you run a fork; set AGY_BRIDGE_NO_UPDATE_CHECK=1 to skip the check entirely.
-GITHUB_REPO = os.environ.get("AGY_BRIDGE_REPO", "SinanTufekci/agent-intern")
 
 AGY_DATA = Path.home() / ".gemini" / "antigravity-cli"
 LAST_CONVERSATIONS = AGY_DATA / "cache" / "last_conversations.json"
@@ -491,60 +752,9 @@ def _compat_warning(version: Optional[tuple[int, int, int]]) -> Optional[str]:
     )
 
 
-def _env_truthy(name: str) -> bool:
-    """True if env var `name` is set to a truthy value (1/true/yes/on)."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _debug_enabled() -> bool:
     """True if AGY_BRIDGE_DEBUG is set to a truthy value (1/true/yes/on)."""
     return _env_truthy("AGY_BRIDGE_DEBUG")
-
-
-def _fetch_latest_release_version() -> Optional[tuple[int, int, int]]:
-    """Best-effort: the highest semver tag published on GITHUB_REPO, or None.
-
-    Hits GitHub's public tags API (no auth) with a short timeout. ANY failure —
-    offline, DNS, rate-limit, HTTP error, unexpected JSON — returns None so the
-    server never blocks or errors on the network at startup.
-    """
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/tags?per_page=100"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "agent-intern-bridge",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            tags = json.load(resp)
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-        return None
-    if not isinstance(tags, list):  # e.g. a {"message": "rate limit"} error body
-        return None
-    versions = [
-        v
-        for v in (_parse_agy_version(t.get("name", "")) for t in tags if isinstance(t, dict))
-        if v is not None
-    ]
-    return max(versions) if versions else None
-
-
-def _update_warning(latest: Optional[tuple[int, int, int]]) -> Optional[str]:
-    """Return a warning if `latest` is a newer bridge version than this file.
-
-    None if no newer release is known, or if either version can't be parsed.
-    """
-    current = _parse_agy_version(__version__)
-    if latest is None or current is None or latest <= current:
-        return None
-    newest = ".".join(map(str, latest))
-    return (
-        f"A newer Agent Intern bridge is available: v{newest} "
-        f"(you are running v{__version__}). Update with `git pull` in the repo, "
-        "then restart Claude Code. Set AGY_BRIDGE_NO_UPDATE_CHECK=1 to silence this."
-    )
 
 
 def _spawn_kwargs(name: str = "") -> dict:
@@ -657,19 +867,26 @@ def _get_agy_version() -> Optional[str]:
 
 
 def _startup_checks() -> None:
-    """Warn (once, at startup) about a stale agy or a newer bridge release.
+    """Warn (once, at startup) about a mistyped tool group or a stale agy.
 
-    Both checks are best-effort and non-fatal: the agy check runs `agy --version`
-    locally; the update check polls GitHub (skipped via AGY_BRIDGE_NO_UPDATE_CHECK,
-    silent on any network failure).
+    Entirely local and non-fatal — this server makes no network calls, so there is
+    no update check here: the agy check just runs `agy --version`, and only when a
+    group that actually drives agy is enabled.
     """
+    unknown = _unknown_tool_groups(os.environ.get(TOOLS_ENV))
+    if unknown:
+        log.warning(
+            "%s lists unknown tool group(s) %s; known groups: %s. Enabled: %s",
+            TOOLS_ENV,
+            ", ".join(unknown),
+            ", ".join(TOOL_GROUPS),
+            ", ".join(sorted(ENABLED_TOOL_GROUPS)) or "(none)",
+        )
+    if not ENABLED_TOOL_GROUPS & {"antigravity", "swarm"}:
+        return  # nothing here drives agy, so don't pay for `agy --version`
     agy_warning = _compat_warning(_parse_agy_version(_get_agy_version() or ""))
     if agy_warning:
         log.warning(agy_warning)
-    if not _env_truthy("AGY_BRIDGE_NO_UPDATE_CHECK"):
-        update_warning = _update_warning(_fetch_latest_release_version())
-        if update_warning:
-            log.warning(update_warning)
 
 
 def _configure_logging() -> None:
@@ -1105,37 +1322,22 @@ def _finalize_image(target: str, agy_text: Optional[str], start: float) -> tuple
 
 
 def _bridge_version_status() -> tuple[str, bool, str]:
-    """Status row for the bridge's own version and whether a newer release exists.
+    """Status row naming the running bridge version and its exposed tool groups.
 
-    Always reports ok=True — an available update is informational, not a fault, so
-    it must not flip the overall status to PROBLEMS FOUND. Honors
-    AGY_BRIDGE_NO_UPDATE_CHECK and stays ok (just uninformative) when GitHub is
-    unreachable. This is what surfaces the update notice in an MCP client's chat
-    (the startup stderr warning only lands in the host's logs).
+    Purely local: no release check, no network. Always ok=True — this row is
+    informational and must not flip the overall status to PROBLEMS FOUND.
     """
-    label = "bridge version"
-    if _env_truthy("AGY_BRIDGE_NO_UPDATE_CHECK"):
-        return (label, True, f"v{__version__} (update check disabled)")
-    latest = _fetch_latest_release_version()
-    if latest is None:
-        return (label, True, f"v{__version__} (update check unavailable — offline?)")
-    current = _parse_agy_version(__version__)
-    if current is not None and latest > current:
-        newest = ".".join(map(str, latest))
-        return (
-            label,
-            True,
-            f"v{__version__} -> v{newest} available; upgrade: uvx agent-intern@latest",
-        )
-    return (label, True, f"v{__version__} (latest)")
+    detail = f"v{__version__} · tools: {', '.join(sorted(ENABLED_TOOL_GROUPS)) or 'none'}"
+    if HIDDEN_TOOLS:
+        detail += f" (hidden: {len(HIDDEN_TOOLS)} tools; set {TOOLS_ENV}=all to expose)"
+    return ("bridge version", True, detail)
 
 
 def _collect_status() -> list[tuple[str, bool, str]]:
     """Gather setup diagnostics as (label, ok, detail) rows.
 
-    Spends no AI Pro quota: runs `agy --version`, inspects local state files, and
-    (unless AGY_BRIDGE_NO_UPDATE_CHECK is set) makes one best-effort GitHub call to
-    report whether a newer bridge release exists.
+    Spends no AI Pro quota and makes no network calls: runs `agy --version` and
+    inspects local state files.
     """
     rows: list[tuple[str, bool, str]] = [_bridge_version_status()]
 
@@ -1585,6 +1787,22 @@ def _newest_new_conv(start: float, exclude: set[str]) -> Optional[str]:
 # at once — they don't share _AGY_LOCK) each get their own window + state instead of
 # clobbering one shared one. Sequential runs reuse the "main" slot and its open
 # window; a run that starts while "main" is still working gets a fresh id + window.
+#
+# ALL of this is inert unless WATCH_ENABLED (AGENT_INTERN_WATCH): _watch_requested
+# refuses every request for a viewer, and _watch_server_port refuses to bind, so
+# the process opens no listening socket and no browser window.
+def _watch_requested(watch: bool) -> bool:
+    """True only if the caller asked for the viewer AND it is enabled.
+
+    Every tool routes its `watch` argument through here. With the viewer off the
+    argument is also stripped from the advertised schema (see _tool), so this is
+    belt-and-braces for a client that passes it anyway, or for an internal caller.
+    """
+    if watch and not WATCH_ENABLED:
+        log.debug("watch=True ignored: viewer disabled (set %s=1 to enable)", WATCH_ENV)
+    return bool(watch) and WATCH_ENABLED
+
+
 _MAIN = "main"
 _WATCH_RUNS: dict[str, dict] = {}
 _WATCH_LOCK = threading.Lock()
@@ -2178,9 +2396,15 @@ def _watch_html() -> str:
 def _ensure_watch_server() -> int:
     """Lazily start the localhost watch server (once per process); return its port.
 
+    Raises RuntimeError unless the viewer is enabled (AGENT_INTERN_WATCH): with it
+    off, this process must never bind a listening socket. Callers reach here only
+    through _watch_requested, so this is the last line of defence, not the gate.
+
     Binds 127.0.0.1 only — the page and events never leave the local machine.
     """
     global _WATCH_SERVER
+    if not WATCH_ENABLED:
+        raise RuntimeError(f"watch viewer is disabled; set {WATCH_ENV}=1 to enable it")
     if _WATCH_SERVER is not None:
         return _WATCH_SERVER[1]
 
@@ -2553,13 +2777,14 @@ def _run_agy_image_watched(
         return f"{final_path}\nformat={fmt}  size={size} bytes"
 
 
-@mcp.tool(
+@_tool(
+    "antigravity",
     annotations={
         "title": "Ask Antigravity (new conversation)",
         "readOnlyHint": False,  # agy runs unsandboxed: may write files / run commands
         "idempotentHint": False,
         "openWorldHint": True,  # talks to the external Antigravity service
-    }
+    },
 )
 async def antigravity_ask(
     prompt: str,
@@ -2598,18 +2823,19 @@ async def antigravity_ask(
     """
     ws = _normalize_workspace(workspace)
     validate_model(model)  # fail fast on a typo (agy would silently ignore it)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(_run_agy_watched, prompt, ws, False, timeout_s, model)
     return await _run_with_progress(_run_agy, (prompt, ws, False, timeout_s, model), ctx, timeout_s)
 
 
-@mcp.tool(
+@_tool(
+    "antigravity",
     annotations={
         "title": "Continue Antigravity conversation",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def antigravity_continue(
     prompt: str,
@@ -2643,18 +2869,19 @@ async def antigravity_continue(
     """
     ws = _normalize_workspace(workspace)
     validate_model(model)  # fail fast on a typo (agy would silently ignore it)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(_run_agy_watched, prompt, ws, True, timeout_s, model)
     return await _run_with_progress(_run_agy, (prompt, ws, True, timeout_s, model), ctx, timeout_s)
 
 
-@mcp.tool(
+@_tool(
+    "antigravity",
     annotations={
         "title": "Generate an image with Antigravity",
         "readOnlyHint": False,  # writes the generated image file to disk
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def antigravity_image(
     prompt: str,
@@ -2691,7 +2918,7 @@ async def antigravity_image(
     target = _resolve_output_path(output_path, ws)
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     wrapped = _wrap_image_prompt(prompt, target)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_agy_image_watched, wrapped, target, ws, timeout_s, prompt
         )
@@ -2732,13 +2959,14 @@ def _broadcast_workspaces(workspaces: Optional[list], n: int):
     return workspaces
 
 
-@mcp.tool(
+@_tool(
+    "swarm",
     annotations={
         "title": "Agent swarm (mixed Antigravity + Codex + Copilot + Cursor + Claude, parallel)",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 def agent_swarm(
     tasks: list[dict],
@@ -2790,17 +3018,18 @@ def agent_swarm(
     """
     import swarm
 
-    results = swarm.swarm_agents(tasks, max_concurrency, timeout_s, watch)
+    results = swarm.swarm_agents(tasks, max_concurrency, timeout_s, _watch_requested(watch))
     return swarm.format_agent_results(results)
 
 
-@mcp.tool(
+@_tool(
+    "swarm",
     annotations={
         "title": "Generate several images in parallel",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 def antigravity_image_swarm(
     prompts: list[str],
@@ -2841,25 +3070,25 @@ def antigravity_image_swarm(
         workspaces=_broadcast_workspaces(workspaces, n),
         max_concurrency=max_concurrency,
         timeout_s=timeout_s,
-        watch=watch,
+        watch=_watch_requested(watch),
     )
     return swarm.format_image_results(results)
 
 
-@mcp.tool(
+@_tool(
+    "antigravity",
     annotations={
         "title": "agy bridge diagnostics",
         "readOnlyHint": True,  # only reads local state + runs `agy --version`
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 def antigravity_status() -> str:
     """Report diagnostics for the agy bridge setup (spends no AI Pro quota).
 
-    Reports the bridge's own version and whether a newer release is available
-    (best-effort GitHub check; honors AGY_BRIDGE_NO_UPDATE_CHECK), then checks
-    whether agy is on PATH (and its version/compat), whether agy's state
+    Reports the bridge's own version and which tool groups it exposes, then
+    checks whether agy is on PATH (and its version/compat), whether agy's state
     directories exist, whether the newest conversation transcript is readable,
     and whether the SQLite conversation store is present. Use this to debug empty
     or failed responses — or to see if the bridge itself is out of date — before
@@ -2875,13 +3104,14 @@ def antigravity_status() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(
+@_tool(
+    "codex",
     annotations={
         "title": "Ask Codex (new session)",
         "readOnlyHint": False,  # codex may edit files when sandbox != read-only
         "idempotentHint": False,
         "openWorldHint": True,  # talks to the external OpenAI/Codex service
-    }
+    },
 )
 async def codex_ask(
     prompt: str,
@@ -2923,7 +3153,7 @@ async def codex_ask(
     """
     ws = codex_bridge.normalize_workspace(workspace)
     codex_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_codex_watched, prompt, ws, sandbox, model, False, timeout_s, effort
         )
@@ -2936,13 +3166,14 @@ async def codex_ask(
     )
 
 
-@mcp.tool(
+@_tool(
+    "codex",
     annotations={
         "title": "Continue Codex session",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def codex_continue(
     prompt: str,
@@ -2969,7 +3200,7 @@ async def codex_continue(
                works (same viewer as codex_ask). Default false.
     """
     ws = codex_bridge.normalize_workspace(workspace)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_codex_watched,
             prompt,
@@ -2989,21 +3220,20 @@ async def codex_continue(
     )
 
 
-@mcp.tool(
+@_tool(
+    "codex",
     annotations={
         "title": "Codex bridge diagnostics",
         "readOnlyHint": True,  # only runs `codex --version` / `codex login status`
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 def codex_status() -> str:
     """Report diagnostics for the Codex bridge setup (spends no quota).
 
-    Reports the bridge's own version and whether a newer release is available
-    (best-effort GitHub check; honors AGY_BRIDGE_NO_UPDATE_CHECK) — the same
-    update notice antigravity_status shows, so a Codex-only install still surfaces
-    it — then checks whether codex is on PATH (and its version), whether you're
+    Reports the bridge's own version and which tool groups it exposes, then
+    checks whether codex is on PATH (and its version), whether you're
     logged in (`codex login status` — no model call, no quota), where codex stores
     its sessions, and how many workspace sessions are pinned this run. Use this to
     debug "codex not found" or auth errors before spending quota.
@@ -3091,13 +3321,14 @@ def _run_codex_watched(
     return answer
 
 
-@mcp.tool(
+@_tool(
+    "copilot",
     annotations={
         "title": "Ask GitHub Copilot (new session)",
         "readOnlyHint": False,  # copilot may edit files / run commands per sandbox
         "idempotentHint": False,
         "openWorldHint": True,  # talks to the external GitHub Copilot service
-    }
+    },
 )
 async def copilot_ask(
     prompt: str,
@@ -3138,7 +3369,7 @@ async def copilot_ask(
     """
     ws = copilot_bridge.normalize_workspace(workspace)
     copilot_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_copilot_watched, prompt, ws, sandbox, model, False, timeout_s
         )
@@ -3151,13 +3382,14 @@ async def copilot_ask(
     )
 
 
-@mcp.tool(
+@_tool(
+    "copilot",
     annotations={
         "title": "Continue GitHub Copilot session",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def copilot_continue(
     prompt: str,
@@ -3187,7 +3419,7 @@ async def copilot_continue(
     """
     ws = copilot_bridge.normalize_workspace(workspace)
     copilot_bridge.validate_sandbox(sandbox)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_copilot_watched, prompt, ws, sandbox, None, True, timeout_s
         )
@@ -3200,21 +3432,20 @@ async def copilot_continue(
     )
 
 
-@mcp.tool(
+@_tool(
+    "copilot",
     annotations={
         "title": "Copilot bridge diagnostics",
         "readOnlyHint": True,  # only runs `copilot --version` + reads local state
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 def copilot_status() -> str:
     """Report diagnostics for the Copilot bridge setup (spends no quota).
 
-    Reports the bridge's own version and whether a newer release is available
-    (best-effort GitHub check; honors AGY_BRIDGE_NO_UPDATE_CHECK) — the same
-    update notice antigravity_status shows, so a Copilot-only install still
-    surfaces it — then checks whether copilot is on PATH (and its version), an auth
+    Reports the bridge's own version and which tool groups it exposes, then
+    checks whether copilot is on PATH (and its version), an auth
     hint (copilot has no `login status` command, so this is best-effort — an env
     token is reported when set, otherwise login via the credential store is
     assumed and unverified), where copilot stores session state, and how many
@@ -3312,13 +3543,14 @@ def _run_copilot_watched(
 
 
 # ============================================================ Cursor tools
-@mcp.tool(
+@_tool(
+    "cursor",
     annotations={
         "title": "Ask Cursor (new chat)",
         "readOnlyHint": False,  # cursor may edit files / run commands per sandbox
         "idempotentHint": False,
         "openWorldHint": True,  # talks to the external Cursor service
-    }
+    },
 )
 async def cursor_ask(
     prompt: str,
@@ -3360,7 +3592,7 @@ async def cursor_ask(
     ws = cursor_bridge.normalize_workspace(workspace)
     cursor_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
     cursor_bridge.validate_model(model)  # fail fast on a typo (cursor models)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_cursor_watched, prompt, ws, sandbox, model, False, timeout_s
         )
@@ -3373,13 +3605,14 @@ async def cursor_ask(
     )
 
 
-@mcp.tool(
+@_tool(
+    "cursor",
     annotations={
         "title": "Continue Cursor chat",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def cursor_continue(
     prompt: str,
@@ -3408,7 +3641,7 @@ async def cursor_continue(
     """
     ws = cursor_bridge.normalize_workspace(workspace)
     cursor_bridge.validate_sandbox(sandbox)
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_cursor_watched, prompt, ws, sandbox, None, True, timeout_s
         )
@@ -3421,21 +3654,20 @@ async def cursor_continue(
     )
 
 
-@mcp.tool(
+@_tool(
+    "cursor",
     annotations={
         "title": "Cursor bridge diagnostics",
         "readOnlyHint": True,  # only runs `cursor-agent --version`/`status` + reads local state
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 def cursor_status() -> str:
     """Report diagnostics for the Cursor bridge setup (spends no quota).
 
-    Reports the bridge's own version and whether a newer release is available
-    (best-effort GitHub check; honors AGY_BRIDGE_NO_UPDATE_CHECK) — the same
-    update notice antigravity_status shows, so a Cursor-only install still surfaces
-    it — then checks whether cursor-agent is found (and its version), whether
+    Reports the bridge's own version and which tool groups it exposes, then
+    checks whether cursor-agent is found (and its version), whether
     you're logged in (`cursor-agent status`), and where cursor stores its chats.
     Use this to debug "cursor not found" or auth errors before spending quota.
     """
@@ -3543,13 +3775,14 @@ def _run_cursor_watched(
     return answer
 
 
-@mcp.tool(
+@_tool(
+    "claude",
     annotations={
         "title": "Ask Claude Code (new session)",
         "readOnlyHint": False,  # claude may edit files under automode / write sandboxes
         "idempotentHint": False,
         "openWorldHint": True,  # talks to the external Claude Code / harness service
-    }
+    },
 )
 async def claude_ask(
     prompt: str,
@@ -3590,7 +3823,7 @@ async def claude_ask(
     ws = claude_bridge.normalize_workspace(workspace)
     claude_bridge.validate_sandbox(sandbox)  # fail fast with a clear message
     claude_bridge.validate_model(model)  # fail fast on a typo'd harness id
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_claude_watched, prompt, ws, sandbox, model, False, timeout_s, effort
         )
@@ -3603,13 +3836,14 @@ async def claude_ask(
     )
 
 
-@mcp.tool(
+@_tool(
+    "claude",
     annotations={
         "title": "Continue Claude Code session",
         "readOnlyHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
 async def claude_continue(
     prompt: str,
@@ -3645,7 +3879,7 @@ async def claude_continue(
     ws = claude_bridge.normalize_workspace(workspace)
     claude_bridge.validate_sandbox(sandbox)
     claude_bridge.validate_model(model)  # fail fast on a typo'd harness id
-    if watch:
+    if _watch_requested(watch):
         return await asyncio.to_thread(
             _run_claude_watched, prompt, ws, sandbox, model, True, timeout_s, effort
         )
@@ -3658,20 +3892,20 @@ async def claude_continue(
     )
 
 
-@mcp.tool(
+@_tool(
+    "claude",
     annotations={
         "title": "Claude Code bridge diagnostics",
         "readOnlyHint": True,  # only runs --version / auth status / reads config
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 def claude_status() -> str:
     """Report diagnostics for the Claude Code bridge setup (spends no quota).
 
-    Reports the bridge's own version and whether a newer release is available
-    (same update notice the other status tools show), then checks whether the
-    `claude` CLI is on PATH (and its version), whether you're authenticated
+    Reports the bridge's own version and which tool groups it exposes, then
+    checks whether the `claude` CLI is on PATH (and its version), whether you're authenticated
     (`claude auth status` — no model call), where sessions are stored, whether the
     claude-os harness is installed and which models/tokens it can reach, and how
     many workspace sessions are pinned this run. Use this to debug "claude not

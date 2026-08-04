@@ -12,6 +12,14 @@ summary.
 
 ### Added
 
+- **Tool visibility groups.** Every MCP tool now belongs to a backend group, and only the *enabled*
+  groups are registered with FastMCP — a hidden group's tools never reach the client's tool list, so
+  the model can't call them and pays no context for their schemas. Default: `codex`, `copilot`,
+  `cursor`, `claude`. **`antigravity` and `swarm` are OFF by default** (both drive `agy -p`, which
+  runs with `--dangerously-skip-permissions` and no usable sandbox). Override with
+  `AGENT_INTERN_TOOLS=all`, a list like `AGENT_INTERN_TOOLS=codex,claude`, or `none`; unknown names
+  are warned about at startup and ignored. Hiding is a registration decision only — the tool
+  functions stay importable, so nothing else changes. `*_status` reports the live groups.
 - **New backend: the Claude Code CLI (`claude -p`)** — `claude_ask`, `claude_continue`, and
   `claude_status` MCP tools, full `agent_swarm` + watch-mode support, on the uniform bridge
   interface. Reads the answer from stdout JSON (`--output-format json`), resumes by pinned session
@@ -33,6 +41,24 @@ summary.
   instructions require a self-contained, explicit prompt (the sub-agent has no shared context).
 - **Quota-free status.** `claude_status` reports the CLI version, `claude auth status`, and the
   claude-os harness (installed, models loaded, endpoint token env vars set).
+
+### Changed
+
+- **Watch mode is opt-in (`AGENT_INTERN_WATCH=1`), off by default.** With it off, the `watch`
+  argument is stripped from every advertised tool schema *and* from the descriptions clients read,
+  is ignored if passed anyway, and **no HTTP listener is ever bound** — `_ensure_watch_server` and
+  `swarm_watch.ensure_server` both refuse. The viewer served prompts, answers, and the commands
+  agents ran over an unauthenticated localhost port with no `Origin`/`Host` check, so it now runs
+  only when explicitly asked for. All the machinery stays in place; the env var restores it whole.
+
+### Removed
+
+- **The startup update check and every outbound network call.** `_fetch_latest_release_version` /
+  `_update_warning` polled `api.github.com` at startup and inside every `*_status`; both are gone,
+  along with `AGY_BRIDGE_REPO`, `AGY_BRIDGE_NO_UPDATE_CHECK`, and the `urllib` imports. The bridge
+  now makes **no network calls of its own** — the only egress is whatever the backend CLIs do. The
+  `bridge version` status row reports the local version and the exposed tool groups instead, and
+  `_startup_checks` no longer probes `agy --version` when no agy-backed group is enabled.
 
 ### Fixed
 
