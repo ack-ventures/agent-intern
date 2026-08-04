@@ -38,7 +38,9 @@ def test_validate_sandbox_rejects_unknown():
 
 
 def test_default_sandbox_is_read_only():
-    # Safe default, parity with codex: best-effort read-only.
+    # Safe default: best-effort read-only. codex now defaults to
+    # workspace-write, but copilot's sandbox isn't an OS boundary, so this one
+    # stays conservative.
     assert copilot_bridge.DEFAULT_SANDBOX == "read-only"
     assert "read-only" in copilot_bridge.SANDBOX_MODES
 

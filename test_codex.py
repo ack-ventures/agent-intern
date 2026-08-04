@@ -37,9 +37,12 @@ def test_validate_sandbox_rejects_unknown():
         codex_bridge.validate_sandbox("yolo")
 
 
-def test_default_sandbox_is_read_only():
-    # The safe default agreed for codex_ask: reads/answers, writes nothing.
-    assert codex_bridge.DEFAULT_SANDBOX == "read-only"
+def test_default_sandbox_is_workspace_write():
+    # codex_ask defaults to acting: making edits under the workspace is the
+    # point of delegating to it, and the sandbox still blocks everything
+    # outside. Callers pass read-only for an answer with no side effects.
+    assert codex_bridge.DEFAULT_SANDBOX == "workspace-write"
+    assert codex_bridge.DEFAULT_SANDBOX in codex_bridge.SANDBOX_MODES
     assert "read-only" in codex_bridge.SANDBOX_MODES
 
 

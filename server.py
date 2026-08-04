@@ -370,8 +370,9 @@ Pick a backend:
 - antigravity_* (Gemini) — fast, cheap tool-calling; the ONLY image model. No \
 real sandbox, so trusted prompts only.
 - codex_* (OpenAI) — strongest reasoning and real repo edits behind a REAL \
-enforced sandbox (read-only by default; pass sandbox="workspace-write" to let \
-it edit files).
+enforced sandbox (workspace-write by default: edits under the workspace, \
+nothing outside it; pass sandbox="read-only" for a look-but-don't-touch \
+answer).
 - copilot_* (GitHub) — agentic coding on a Copilot plan; sandbox is best-effort, \
 not an OS boundary.
 - cursor_* (Cursor) — agentic coding on a Cursor plan, with a wide model menu \
@@ -2903,11 +2904,12 @@ async def codex_ask(
     Args:
         prompt: Question or instruction for Codex.
         workspace: Working root for the session (`-C`). Defaults to the server cwd.
-        sandbox: Filesystem policy — "read-only" (default: reads and answers but
-                 writes nothing), "workspace-write" (may edit files under the
-                 workspace), or "danger-full-access" (no sandbox — avoid). `codex
-                 exec` has no interactive approval gate, so this is the real safety
-                 boundary; opt into write access deliberately.
+        sandbox: Filesystem policy — "workspace-write" (default: may edit files
+                 under the workspace, nothing outside it), "read-only" (reads and
+                 answers but writes nothing), or "danger-full-access" (no sandbox
+                 — avoid). `codex exec` has no interactive approval gate, so this
+                 is the real safety boundary; pass "read-only" when you only want
+                 an answer.
         model: Optional model override (`-m`); omit to use codex's configured default.
         effort: Optional reasoning effort override (`-c model_reasoning_effort=...`,
                 e.g. "low" | "medium" | "high" | "xhigh"); omit to use codex's

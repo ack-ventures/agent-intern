@@ -23,10 +23,12 @@ from the 0.141.0 baseline).
 
 SECURITY. `codex exec` runs the model as an autonomous agent with no interactive
 approval gate. Unlike agy's no-op `--sandbox`, codex's `-s/--sandbox` is a REAL
-boundary: the default `read-only` lets the agent read and answer but change
-nothing on disk; callers must opt into `workspace-write` (edit files under the
-workspace) or `danger-full-access` (no sandbox — avoid). Even so, only run it
-with trusted prompts on trusted content.
+boundary. The default is `workspace-write`: the agent edits files under the
+workspace but nothing outside it — delegating real work is the point, and a
+read-only default made every write-shaped call fail on the first edit. Callers
+pass `read-only` when they want an answer with no side effects, or
+`danger-full-access` (no sandbox — avoid). Only run it with trusted prompts on
+trusted content.
 """
 
 from __future__ import annotations
@@ -53,11 +55,12 @@ CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 SESSIONS_DIR = CODEX_HOME / "sessions"
 
-# codex exec -s/--sandbox accepts exactly these. Default read-only = safe: the
-# agent can read and answer but cannot modify the filesystem. Callers opt into
-# write access explicitly per call.
+# codex exec -s/--sandbox accepts exactly these. Default workspace-write: the
+# agent can edit files under the workspace it was pointed at, but the sandbox
+# still blocks everything outside it. Callers pass read-only per call when they
+# want a look-but-don't-touch answer.
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
-DEFAULT_SANDBOX = "read-only"
+DEFAULT_SANDBOX = "workspace-write"
 
 # A session id is a UUID; it appears in the rollout filename
 # (rollout-<ts>-<uuid>.jsonl) and in the first line's session_meta.payload.id.
