@@ -509,6 +509,27 @@ def build_args(
     `json_stream` switches --output-format to stream-json for watch mode. For
     harness models, argv[0] is `claude-os` and the CLAUDE_OS_MODEL env is returned
     separately via launcher_env().
+
+    ORDER QUIRK: _mcp_guard_flags() is placed BEFORE _permission_flags(), not
+    after. This is load-bearing, not stylistic. claude CLI v2.1.221 has an
+    arg-parser bug: when `--mcp-config`'s JSON value is the token immediately
+    before the trailing positional prompt, with no other recognized flag between
+    them, claude mis-resolves the mcp-config value and tries to treat the prompt
+    text as (part of) a file path, failing with "Invalid MCP configuration: MCP
+    config file not found: <cwd>/<prompt text>". Verified at the shell:
+        claude -p --output-format json --permission-mode auto --strict-mcp-config \
+            --mcp-config '{"mcpServers":{}}' 'ping'   # fails
+        claude -p --output-format json --strict-mcp-config --mcp-config '...' \
+            --permission-mode auto 'ping'              # succeeds
+    This bites for real whenever nothing else sits between the mcp guard and the
+    prompt: harness models never pass --model (see _resolve_launcher's
+    docstring), and a run with no --effort/--resume has nothing else to fill the
+    gap either. _permission_flags() always returns at least one flag token for
+    every sandbox mode, so placing it right after _mcp_guard_flags() guarantees a
+    recognized flag always separates the mcp-config value from the prompt. Do
+    not reorder this back or special-case it away with a dummy trailing flag —
+    the reorder is the structurally-correct fix; see test_claude.py's
+    test_build_args_mcp_config_value_never_immediately_precedes_prompt.
     """
     bin, _env, model_arg = _resolve_launcher(model)
     args = [bin, "-p"]
@@ -516,8 +537,8 @@ def build_args(
         args += ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     else:
         args += ["--output-format", "json"]
-    args += _permission_flags(sandbox)
     args += _mcp_guard_flags()
+    args += _permission_flags(sandbox)
     if model_arg:
         args += ["--model", model_arg]
     if effort:

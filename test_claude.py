@@ -309,6 +309,50 @@ def test_build_args_no_effort_by_default():
     assert "--effort" not in args
 
 
+@pytest.mark.parametrize("sandbox", claude_bridge.SANDBOX_MODES)
+@pytest.mark.parametrize("model", [None, "sonnet", "ds-flash"])
+@pytest.mark.parametrize("resume_session", [None, claude_bridge._CONTINUE, SAMPLE_SID])
+@pytest.mark.parametrize("effort", [None, "high"])
+@pytest.mark.parametrize("json_stream", [False, True])
+def test_build_args_mcp_config_value_never_immediately_precedes_prompt(
+    sandbox, model, resume_session, effort, json_stream
+):
+    """Regression for a claude CLI (v2.1.221) arg-parser bug: when `--mcp-config`'s
+    JSON value is the token immediately before the trailing positional prompt, with
+    no other recognized flag in between, claude mis-resolves the mcp-config value
+    and tries to treat the prompt text as (part of) a file path, failing with:
+
+        Error: Invalid MCP configuration:
+        MCP config file not found: <cwd>/<prompt text>
+
+    Reproduced directly at the shell, bypassing this bridge and claude-os entirely,
+    with the exact minimal argv this bridge used to build for harness models with
+    no --model/--effort/--resume flag (the most common harness-model case):
+
+        claude -p --output-format json --permission-mode auto --strict-mcp-config \\
+            --mcp-config '{"mcpServers":{}}' 'ping'
+        # => Error: Invalid MCP configuration: MCP config file not found: <cwd>/ping
+
+    Adding any recognized flag between the mcp-config value and the prompt (e.g.
+    --model, or reordering --mcp-config earlier so --permission-mode follows it)
+    avoids the bug. We can't invoke the real claude binary from a unit test (no
+    network/quota here), so this test locks the structural invariant instead:
+    across every sandbox/model/effort/resume/stream combination, --mcp-config's
+    value must never be the immediate predecessor of the trailing prompt arg.
+    """
+    args = claude_bridge.build_args(
+        "prompt text", "ws", sandbox, model, resume_session, json_stream=json_stream, effort=effort
+    )
+    assert args[-1] == "prompt text"
+    if "--mcp-config" not in args:
+        return  # CLAUDE_BRIDGE_INHERIT_MCP=1 path — no mcp-config flag at all
+    mcp_value_idx = args.index("--mcp-config") + 1
+    assert mcp_value_idx != len(args) - 2, (
+        "--mcp-config's value sits immediately before the trailing prompt arg, "
+        f"the exact shape that triggers the claude CLI parser bug: {args}"
+    )
+
+
 # --------------------------------------------------------------------------
 # _parse_json_result — banner tolerance + error paths
 # --------------------------------------------------------------------------
